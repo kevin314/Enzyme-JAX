@@ -11,6 +11,18 @@
 
 include "mlir/Pass/PassBase.td"
 
+def BlasRaisingPass : Pass<"blas-raise"> {
+  let summary = "Convert CuBlas calls into mlho calls";
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "mhlo::MhloDialect",
+    "stablehlo::StablehloDialect",
+    "chlo::ChloDialect",
+    "enzyme::EnzymeDialect",
+    "mlir::LLVM::LLVMDialect"
+  ];
+}
+
 def CanonicalizeLoopsPass : InterfacePass<"canonicalize-loops", 
                                           "mlir::FunctionOpInterface"> {
   let summary = "Canonicalize loops";
