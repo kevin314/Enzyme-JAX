@@ -283,7 +283,7 @@ struct Pointer2MemrefOpLowering
     auto space1 = op.getType().getMemorySpaceAsInt();
     if (auto PT = dyn_cast<LLVM::LLVMPointerType>(convertedType)) {
       mlir::Value ptr = adaptor.getSource();
-      if (space1 != cast<LLVM::LLVMPointerType>(op.getOperand().getType())
+      if (space1 != cast<LLVM::LLVMPointerType>(op.getSource().getType())
                         .getAddressSpace())
         ptr = LLVM::AddrSpaceCastOp::create(rewriter, loc, PT, ptr);
       rewriter.replaceOp(op, {ptr});
@@ -293,7 +293,7 @@ struct Pointer2MemrefOpLowering
     auto descr = MemRefDescriptor::poison(rewriter, loc, convertedType);
     Value ptr = adaptor.getSource();
 
-    if (space1 != cast<LLVM::LLVMPointerType>(op.getOperand().getType())
+    if (space1 != cast<LLVM::LLVMPointerType>(op.getSource().getType())
                       .getAddressSpace())
       ptr = LLVM::AddrSpaceCastOp::create(rewriter, loc,
                                           descr.getElementPtrType(), ptr);

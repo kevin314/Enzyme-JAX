@@ -12,14 +12,17 @@
 include "mlir/Pass/PassBase.td"
 
 def BlasRaisingPass : Pass<"blas-raise"> {
-  let summary = "Convert CuBlas calls into mlho calls";
+  let summary = "Convert CuBlas calls into mhlo calls";
   let dependentDialects = [
     "arith::ArithDialect",
     "mhlo::MhloDialect",
     "stablehlo::StablehloDialect",
     "chlo::ChloDialect",
     "enzyme::EnzymeDialect",
-    "mlir::LLVM::LLVMDialect"
+    "enzymexla::EnzymeXLADialect",
+    "mlir::LLVM::LLVMDialect",
+    "memref::MemRefDialect",
+    "tensor::TensorDialect"
   ];
 }
 
@@ -443,6 +446,26 @@ def LowerEnzymeXLALinalgPass : Pass<"lower-enzymexla-linalg"> {
         /*type=*/"int",
         /*default=*/"64",
         /*description=*/"Blas int width (32 or 64). Only used for CPU backend.">,
+  ];
+}
+
+def LowerEnzymeXLABlasPass : Pass<"lower-enzymexla-blas"> {
+  let summary = "Lower enzymexla.linalg.gemm ops to backend-specific code";
+  let dependentDialects = [
+    "stablehlo::StablehloDialect",
+    "tensor::TensorDialect",
+    "memref::MemRefDialect",
+    "enzymexla::EnzymeXLADialect",
+    "LLVM::LLVMDialect",
+  ];
+
+  let options = [
+    Option<
+        /*C++ variable name=*/"backend",
+        /*CLI argument=*/"backend",
+        /*type=*/"std::string",
+        /*default=*/"\"xla\"",
+        /*description=*/"HW backend">,
   ];
 }
 

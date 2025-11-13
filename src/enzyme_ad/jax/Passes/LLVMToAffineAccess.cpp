@@ -311,7 +311,7 @@ convertLLVMAllocaToMemrefAlloca(FromAlloc alloc, RewriterBase &rewriter,
     Value replacement = newAlloc;
     if (memrefType.getElementType() != p2m.getType().getElementType()) {
       replacement = enzymexla::Memref2PointerOp::create(
-          rewriter, alloc->getLoc(), p2m.getOperand().getType(), replacement);
+          rewriter, alloc->getLoc(), p2m.getSource().getType(), replacement);
       rewriter.modifyOpInPlace(
           p2m, [&]() { p2m.getSourceMutable().set(replacement); });
       continue;
@@ -511,7 +511,7 @@ struct GEPOfMemRefLoad : public OpRewritePattern<memref::LoadOp> {
     auto ptr = ld.getMemRef().getDefiningOp<enzymexla::Pointer2MemrefOp>();
     if (!ptr)
       return failure();
-    auto gep = ptr.getOperand().getDefiningOp<LLVM::GEPOp>();
+    auto gep = ptr.getSource().getDefiningOp<LLVM::GEPOp>();
     if (!gep)
       return failure();
     Type currentType = gep.getElemType();
@@ -721,7 +721,7 @@ struct Pointer2MemrefSelect
 
   LogicalResult matchAndRewrite(enzymexla::Pointer2MemrefOp p2m,
                                 PatternRewriter &rewriter) const override {
-    auto sel = p2m.getOperand().getDefiningOp<arith::SelectOp>();
+    auto sel = p2m.getSource().getDefiningOp<arith::SelectOp>();
     if (!sel)
       return failure();
 
@@ -1817,7 +1817,7 @@ convertLLVMToAffineAccess(Operation *op,
         auto memrefTy = memref0.getType();
         if (memrefTy.getElementType() != ty) {
           if (auto p2m = memref.getDefiningOp<enzymexla::Pointer2MemrefOp>())
-            memref = p2m.getOperand();
+            memref = p2m.getSource();
           else
             memref = enzymexla::Memref2PointerOp::create(
                 rewriter, load.getLoc(),
@@ -1889,7 +1889,7 @@ convertLLVMToAffineAccess(Operation *op,
         auto memrefTy = memref0.getType();
         if (memrefTy.getElementType() != ty) {
           if (auto p2m = memref.getDefiningOp<enzymexla::Pointer2MemrefOp>())
-            memref = p2m.getOperand();
+            memref = p2m.getSource();
           else
             memref = enzymexla::Memref2PointerOp::create(
                 rewriter, store.getLoc(),

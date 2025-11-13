@@ -308,14 +308,18 @@ def Memref2PointerOp : EnzymeXLA_Op<"memref2pointer", [
 def Pointer2MemrefOp : EnzymeXLA_Op<"pointer2memref", [
   ViewLikeOpInterface, Pure
 ]> {
-  let summary = "Upgrade a pointer to a memref";
+  let summary = "Upgrade a pointer to a memref with optional shape";
 
-  let arguments = (ins LLVM_AnyPointer:$source);
+  let arguments = (ins
+    LLVM_AnyPointer:$source,
+    Variadic<Index>:$shape
+  );
   let results = (outs AnyMemRef : $result);
 
   let hasFolder = 1;
   let hasCanonicalizer = 1;
-  
+  let hasVerifier = 1;
+
   let extraClassDeclaration = [{
     ::mlir::Value getViewSource() { return getSource(); }
   }];
@@ -420,6 +424,33 @@ def SymmOp: EnzymeXLA_Op<"lapack.symm", [Pure, SameOperandsAndResultElementType]
 
   let assemblyFormat = [{
     $A `,` $B `,` $C `,` $alpha `,` $beta attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def GemmOp: EnzymeXLA_Op<"linalg.gemm", [Pure]> {
+  let summary = "General matrix multiply with alpha/beta scaling";
+
+  let description = [{
+    Compute C = alpha*(A @ B) + beta*C, where:
+    - A is an m x k matrix
+    - B is a k x n matrix
+    - C is an m x n matrix
+    - alpha and beta are scalar values
+    This is the standard GEMM operation (GEneral Matrix-Matrix multiply)
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$A,
+    AnyMemRef:$B,
+    AnyType:$alpha,
+    AnyType:$beta,
+    AnyMemRef:$C
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    $A `,` $B `,` $alpha `,` $beta `,` $C attr-dict `:` functional-type(operands, results)
   }];
 }
 

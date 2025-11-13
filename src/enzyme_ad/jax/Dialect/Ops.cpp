@@ -1355,6 +1355,22 @@ LogicalResult enzymexla::MemcpyOp::verify() {
   return success();
 }
 
+LogicalResult enzymexla::Pointer2MemrefOp::verify() {
+  auto resultType = llvm::dyn_cast<MemRefType>(getResult().getType());
+  if (!resultType)
+    return emitOpError("result must be a memref type");
+
+  auto dynamicDims = resultType.getNumDynamicDims();
+  auto shapeSize = getShape().size();
+  if (shapeSize > 0 && shapeSize != dynamicDims) {
+    return emitOpError("number of shape operands (")
+           << shapeSize << ") must match number of dynamic dimensions ("
+           << dynamicDims << ")";
+  }
+
+  return success();
+}
+
 namespace {
 
 /// Erases a common case of copy ops where a destination value is used only by
@@ -1688,7 +1704,7 @@ LogicalResult fixupGetFunc(LLVM::CallOp op, OpBuilder &rewriter,
     else if (auto mt = pval.getDefiningOp<Memref2PointerOp>())
       pval = mt.getOperand();
     else if (auto mt = pval.getDefiningOp<Pointer2MemrefOp>())
-      pval = mt.getOperand();
+      pval = mt.getSource();  // Use getSource() for Pointer2MemrefOp
     else
       break;
   }
