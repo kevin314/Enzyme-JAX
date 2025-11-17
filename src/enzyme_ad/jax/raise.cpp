@@ -105,11 +105,11 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
       "canonicalize,delinearize-indexing,canonicalize,simplify-affine-exprs,"
       "affine-cfg,canonicalize,llvm-to-affine-access,canonicalize,"
       "func.func(affine-loop-invariant-code-motion),"
-      "canonicalize,sort-memory,blas-raise,";
+      "canonicalize,sort-memory,";
   if (StringRef(backend).starts_with("xla")) {
     // The new pass should probably be around "raise-affine-to-stablehlo", and might even be rolled up into that pass
-      pass_pipeline += "raise-affine-to-stablehlo{prefer_while_raising=false "
-      "dump_failed_lockstep=true},canonicalize,arith-raise{stablehlo=true},"
+      pass_pipeline += "print,blas-raise,print,raise-affine-to-stablehlo{prefer_while_raising=false "
+      "dump_failed_lockstep=true},print,canonicalize,arith-raise{stablehlo=true},"
       "symbol-dce";
       if (outfile.size() && getenv("EXPORT_REACTANT")) {
         pass_pipeline += ",print{filename="+outfile+".mlir}";
@@ -233,6 +233,8 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
   if (getenv("DEBUG_REACTANT")) {
     llvm::errs() << " final llvm:" << res << "\n";
   }
+  llvm::errs() << " final llvm:" << res << "\n";
+
 
   return res;
 }

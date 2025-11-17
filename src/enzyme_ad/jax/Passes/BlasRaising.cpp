@@ -48,145 +48,247 @@ struct BlasRaisingPass
     : public enzyme::impl::BlasRaisingPassBase<BlasRaisingPass> {
   using BlasRaisingPassBase::BlasRaisingPassBase;
 
-  // Helper to extract and validate cublasSgemm operands
-  struct CublasSgemmOperands {
-    Value handle;
-    Value transA;
-    Value transB;
-    Value m;
-    Value n;
-    Value k;
-    Value alphaPtr;
-    Value A;
-    Value lda;
-    Value B;
-    Value ldb;
-    Value betaPtr;
-    Value C;
-    Value ldc;
-  };
+  // TODO: Handle differing leading dimensions, update C in place instead of returning it
+  func::FuncOp getCublasSGemm_v2(LLVM::LLVMFuncOp func) {
+    constexpr StringRef fnName = "raised_cublasSGemm_v2";
+    auto module = func->getParentOfType<ModuleOp>();
 
-  bool extractCublasSgemmOperands(LLVM::CallOp call,
-                                   CublasSgemmOperands &operands) const {
-    if (call.getNumOperands() != 14) {
-      llvm::errs() << "Warning: cublasSgemm_v2 has " << call.getNumOperands()
-                   << " operands, expected 14\n";
-      return false;
+    if (func::FuncOp existing =
+            module.lookupSymbol<func::FuncOp>(fnName)) {
+      llvm::errs() << "early exit\n";
+      return existing;
     }
 
-    operands.handle = call.getOperand(0);
-    operands.transA = call.getOperand(1);
-    operands.transB = call.getOperand(2);
-    operands.m = call.getOperand(3);
-    operands.n = call.getOperand(4);
-    operands.k = call.getOperand(5);
-    operands.alphaPtr = call.getOperand(6);
-    operands.A = call.getOperand(7);
-    operands.lda = call.getOperand(8);
-    operands.B = call.getOperand(9);
-    operands.ldb = call.getOperand(10);
-    operands.betaPtr = call.getOperand(11);
-    operands.C = call.getOperand(12);
-    operands.ldc = call.getOperand(13);
+    MLIRContext *ctx = func.getContext();
+    OpBuilder builder(ctx);
+    auto loc = func.getLoc();
 
-    llvm::errs() << "Successfully extracted cublasSgemm_v2 operands\n";
-    return true;
-  }
+    auto f32 = builder.getF32Type();
+    auto i32 = builder.getI32Type();
+    Type dynTensor = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, f32);
 
-  Value loadScalarFromPointer(Value ptr, OpBuilder &builder, Location loc) const {
-    auto f32Type = builder.getF32Type();
-    auto scalarMemrefType = MemRefType::get({}, f32Type);
+    // original type
+    auto inputs = func.getArgumentTypes();
+    // auto results = func.getResultTypes();
 
-    auto p2m = builder.create<enzymexla::Pointer2MemrefOp>(
-        loc, scalarMemrefType, ptr, ValueRange{});
+    // Construct new input type list excluding the first one
+    SmallVector<Type> newInputs;
+    newInputs.append(inputs.begin() + 1, inputs.end());
+    newInputs[6] = dynTensor;
+    newInputs[8] = dynTensor;
+    newInputs[11] = dynTensor;
 
-    auto loaded = builder.create<memref::LoadOp>(loc, p2m.getResult());
+    SmallVector<Type> results;
+    results.push_back(dynTensor);
+    // Create new function type
+    auto newFuncType = mlir::FunctionType::get(ctx, newInputs, results);
+      // return existing;
+    
+    for (Type t : newInputs) {
+      t.dump();
+    }
+    
+    // Block *body = &originalFunc->getRegion(0).front();
+    // Block *newBlock = new Block();
 
-    return loaded.getResult();
-  }
+    auto fn = func::FuncOp::create(func.getLoc(), fnName, newFuncType);
+    fn.setPrivate();
+    module.push_back(fn);
 
-  Value pointerToMemref(Value ptr, Value rows, Value cols, OpBuilder &builder,
-                       Location loc) const {
-    auto f32Type = builder.getF32Type();
-    auto memrefType = MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, f32Type);
 
-    auto p2m = builder.create<enzymexla::Pointer2MemrefOp>(
-        loc, memrefType, ptr, ValueRange{rows, cols});
+    // Construct replacement function
 
-    return p2m.getResult();
-  }
+    Block *entry = fn.addEntryBlock();
+    OpBuilder bodyBuilder(entry, entry->begin());
 
-  Value createDotGeneral(Value A, Value B, OpBuilder &builder,
-                        Location loc) const {
-    auto ctx = builder.getContext();
-    llvm::SmallVector<int64_t> batchDimsA, batchDimsB;
-    llvm::SmallVector<int64_t> contractingDimsA{1};
-    llvm::SmallVector<int64_t> contractingDimsB{0};
+    // Extract arguments
+    auto args = entry->getArguments();
+    Value transA = args[0];
+    Value transB = args[1];
+    Value m = args[2];
+    Value n = args[3];
+    Value k = args[4];
+    Value alpha_ptr = args[5];
+    Value A = args[6];
+    Value lda = args[7];
+    Value B = args[8];
+    Value ldb = args[9];
+    Value beta_ptr = args[10];
+    Value C = args[11];
+    Value ldc = args[12];
+
+
+    Value alpha = bodyBuilder.create<LLVM::LoadOp>(loc, f32, alpha_ptr);
+    Value beta = bodyBuilder.create<LLVM::LoadOp>(loc, f32, beta_ptr);
+    // STEP 1. Slice A and B based on transpose and leading dimensions.
+    // Use stablehlo.slice & stablehlo.transpose.
+    // Compute shapes: [m, k] or [k, m] depending on trans flags.
+    auto idxTy = bodyBuilder.getIndexType();
+
+    // Zero constant index
+    auto zero = bodyBuilder.create<arith::ConstantIntOp>(loc, 0, 32);
+    Value zero_tensor = tensor::FromElementsOp::create(
+        bodyBuilder,
+        loc,
+        RankedTensorType::get({2}, i32),
+        ValueRange{zero, zero}
+      );
+
+    // We build dynamic slice sizes [m,k] or swapped
+    auto one = bodyBuilder.create<arith::ConstantIntOp>(loc, 1, 32);
+    Value one_tensor = tensor::FromElementsOp::create(
+        bodyBuilder,
+        loc,
+        RankedTensorType::get({2}, i32),
+        ValueRange{one, one}
+      );
+
+    auto buildSlice = [&](Value tensor, Value dim0, Value dim1,
+                          Value leadingDim) -> Value {
+      Value limit_tensor = tensor::FromElementsOp::create(
+          bodyBuilder,
+          loc,
+          RankedTensorType::get({2}, i32),
+          ValueRange{dim0, dim1}
+        );
+      return stablehlo::RealDynamicSliceOp::create(bodyBuilder, loc, dynTensor, tensor, zero_tensor, limit_tensor, one_tensor);
+    };
+
+    // Slice true shapes before transpose
+    Value A_sliced = buildSlice(A, m, k, lda);
+    Value B_sliced = buildSlice(B, k, n, ldb);
+
+    // Transpose conditionally
+    auto transpose2D = [&](OpBuilder &myBuilder, Value t) -> Value {
+      SmallVector<int64_t> perm{1, 0};
+      return stablehlo::TransposeOp::create(
+          myBuilder,
+          loc, dynTensor, t,
+          perm
+        );
+    };
+
+
+    auto boolTy = bodyBuilder.getI1Type();
+    auto tensor1BoolTy = RankedTensorType::get({}, boolTy);
+    auto transANonZero = bodyBuilder.create<arith::CmpIOp>(
+        loc,
+        arith::CmpIPredicate::ne,
+        transA,          // lhs : i32
+        zero          // rhs : i32
+      );
+
+    Value tensorBoolA = tensor::FromElementsOp::create(
+      bodyBuilder,
+        loc,
+        tensor1BoolTy,
+        ValueRange{transANonZero}
+    );
+    auto A_if = stablehlo::IfOp::create(
+        bodyBuilder,
+        loc,
+        A_sliced.getType(),   // result type
+        tensorBoolA
+    );
+
+    // Fill in the "then" region
+    auto &thenRegion = A_if.getTrueBranch();
+    Block *thenBlock = new mlir::Block();
+    thenRegion.push_back(thenBlock);
+    OpBuilder ifBuilder(thenBlock, thenBlock->begin());
+    Value thenVal = transpose2D(ifBuilder, A_sliced); // produce Value of type resultType
+    ifBuilder.create<stablehlo::ReturnOp>(loc, thenVal);
+
+    // Fill in the "else" region
+    auto &elseRegion = A_if.getFalseBranch();
+    Block *elseBlock = new mlir::Block();
+    elseRegion.push_back(elseBlock);
+    OpBuilder elseBuilder(elseBlock, elseBlock->begin());
+    elseBuilder.create<stablehlo::ReturnOp>(loc, A_sliced);
+
+    Value A_eff = A_if.getResult(0);
+
+
+    Value B_eff = B_sliced;
+    // Value B_eff = stablehlo::IfOp::create(
+    //     bodyBuilder,
+    //     loc, transB, transpose2D(B_sliced), B_sliced
+    //   );
+
+    // STEP 2: Dot general: A_eff [m,k], B_eff [k,n] => [m,n]
+    // Mixed batch dims are empty; contracting dimension is {1}.
+    // auto resultType = UnrankedTensorType::get(f32);
 
     auto dotDimNumbers = stablehlo::DotDimensionNumbersAttr::get(
-        ctx,
-        batchDimsA, batchDimsB,
-        contractingDimsA, contractingDimsB);
+        bodyBuilder.getContext(),
+        /*lhsBatchingDims=*/{},
+        /*rhsBatchingDims=*/{},
+        /*lhsContractingDims=*/{1},
+        /*rhsContractingDims=*/{0}
+      );
 
-    auto aType = llvm::dyn_cast<ShapedType>(A.getType());
-    auto bType = llvm::dyn_cast<ShapedType>(B.getType());
-    if (!aType || !bType) {
-      llvm::errs() << "Error: A or B type is not a ShapedType\n";
-      return A;
-    }
+    Value dot =
+        stablehlo::DotGeneralOp::create(
+            bodyBuilder,
+            loc, dynTensor, A_eff, B_eff,
+            dotDimNumbers, nullptr, nullptr);
+    // Value dot = builder.create<stablehlo::DotGeneralOp>(
+    //     loc, resultType, A, B, dotDimNumbers,
+    //     nullptr,  // precision_config
+    //     nullptr); // algorithm
 
-    // Result shape is (m, n)
-    llvm::SmallVector<int64_t> resultShape{aType.getShape()[0], bType.getShape()[1]};
-    auto f32Type = builder.getF32Type();
-    auto resultType = RankedTensorType::get(resultShape, f32Type);
+    // STEP 3: alpha * dot + beta * C
+    // Scale dot
+    Value broadcastSize = tensor::FromElementsOp::create(
+      bodyBuilder,
+      loc,
+      RankedTensorType::get({2}, i32),
+      ValueRange{m, n}
+    );
+    llvm::ArrayRef<int64_t> b_dims = {0, 1};
+    auto b_dimsAttr = mlir::DenseI64ArrayAttr::get(ctx, b_dims);
+    Value alphaR0Tensor = tensor::FromElementsOp::create(
+      bodyBuilder,
+      loc,
+      RankedTensorType::get({1, 1}, f32),
+      ValueRange{alpha}
+    );
+    Value alphaBroadcast = stablehlo::DynamicBroadcastInDimOp::create(
+        bodyBuilder,
+        loc, dot.getType(), alphaR0Tensor, broadcastSize, b_dimsAttr);
 
-    auto dotGeneralOp = builder.create<stablehlo::DotGeneralOp>(
-        loc, resultType, A, B, dotDimNumbers,
-        nullptr,  // precision_config
-        nullptr); // algorithm
+    Value scaledDot = bodyBuilder.create<stablehlo::MulOp>(
+      loc,
+      dynTensor,
+      dot,
+      alphaBroadcast);
 
-    return dotGeneralOp.getResult();
-  }
+    // Slice C to correct [m,n] shape
+    Value C_sliced = buildSlice(C, m, n, ldc);
 
-  Value applyAlphaScaling(Value result, Value alpha,
-                         OpBuilder &builder, Location loc) const {
-    auto resultType = llvm::dyn_cast<ShapedType>(result.getType());
-    if (!resultType) {
-      llvm::errs() << "Error: result type is not a ShapedType\n";
-      return result;
-    }
-    auto resultShape = resultType.getShape();
+    // Scale C
+    Value betaR0Tensor = tensor::FromElementsOp::create(
+      bodyBuilder,
+      loc,
+      RankedTensorType::get({1, 1}, f32),
+      ValueRange{beta}
+    );
+    Value betaBroadcast = stablehlo::DynamicBroadcastInDimOp::create(
+        bodyBuilder,
+        loc, dot.getType(), betaR0Tensor, broadcastSize, b_dimsAttr);
+    Value scaledC = bodyBuilder.create<stablehlo::MulOp>(
+      loc,
+      dynTensor,
+      C_sliced,
+      betaBroadcast);
 
-    auto alphaBroadcasted = builder.create<stablehlo::BroadcastOp>(
-        loc, resultType, alpha,
-        DenseI64ArrayAttr::get(builder.getContext(), resultShape));
+    // Add: out = scaledDot + scaledC
+    Value out =
+        bodyBuilder.create<stablehlo::AddOp>(loc, dynTensor, scaledDot,
+                                            scaledC);
 
-    auto scaled = builder.create<stablehlo::MulOp>(
-        loc, result, alphaBroadcasted);
-
-    return scaled.getResult();
-  }
-
-  Value applyBetaAccumulation(Value result, Value C, Value beta,
-                             OpBuilder &builder, Location loc) const {
-    auto cType = llvm::dyn_cast<ShapedType>(C.getType());
-    if (!cType) {
-      llvm::errs() << "Error: C type is not a ShapedType\n";
-      return result;
-    }
-    auto cShape = cType.getShape();
-
-    auto betaBroadcasted = builder.create<stablehlo::BroadcastOp>(
-        loc, cType, beta,
-        DenseI64ArrayAttr::get(builder.getContext(), cShape));
-
-    auto scaled = builder.create<stablehlo::MulOp>(
-        loc, C, betaBroadcasted);
-
-    auto accumulated = builder.create<stablehlo::AddOp>(
-        loc, result, scaled);
-
-    return accumulated.getResult();
+    bodyBuilder.create<func::ReturnOp>(loc, ValueRange{out});
+    return fn;
   }
 
   void runOnOperation() override {
@@ -194,70 +296,20 @@ struct BlasRaisingPass
     llvm::errs() << "=== BlasRaisingPass running ===\n";
     llvm::errs().flush();
 
-    SmallVector<LLVM::CallOp, 4> cublasCalls;
+    op->walk([&](LLVM::LLVMFuncOp callOp) {
+      auto calleeName = callOp.getName();
+      llvm::errs() << "name: " << calleeName << "\n";
 
-    op->walk([&](LLVM::CallOp callOp) {
-      auto calleeName = callOp.getCallee().value_or("");
       if (calleeName == "cublasSgemm_v2") {
-        llvm::errs() << "Found cublasSgemm_v2 call\n";
-        cublasCalls.push_back(callOp);
+        llvm::errs() << "one call found\n";
+        getCublasSGemm_v2(callOp);
+
+        // cublasCalls.push_back(callOp);
       }
     });
 
-    llvm::errs() << "Found " << cublasCalls.size() << " cublasSgemm_v2 calls\n";
-    llvm::errs().flush();
-
-    for (auto call : cublasCalls) {
-      CublasSgemmOperands operands;
-      if (!extractCublasSgemmOperands(call, operands)) {
-        llvm::errs() << "Failed to extract operands for cublasSgemm_v2\n";
-        continue;
-      }
-
-      llvm::errs() << "Transforming cublasSgemm_v2 call\n";
-
-      OpBuilder builder(call);
-      builder.setInsertionPoint(call);
-
-      auto m_index = builder.create<arith::IndexCastOp>(
-          call.getLoc(), builder.getIndexType(), operands.m);
-      auto n_index = builder.create<arith::IndexCastOp>(
-          call.getLoc(), builder.getIndexType(), operands.n);
-      auto k_index = builder.create<arith::IndexCastOp>(
-          call.getLoc(), builder.getIndexType(), operands.k);
-
-      Value A_memref = pointerToMemref(operands.A, m_index.getResult(), k_index.getResult(), builder, call.getLoc());
-      Value B_memref = pointerToMemref(operands.B, k_index.getResult(), n_index.getResult(), builder, call.getLoc());
-      Value C_memref = pointerToMemref(operands.C, m_index.getResult(), n_index.getResult(), builder, call.getLoc());
-
-      Value alpha = loadScalarFromPointer(operands.alphaPtr, builder, call.getLoc());
-      Value beta = loadScalarFromPointer(operands.betaPtr, builder, call.getLoc());
-
-      llvm::errs() << "Successfully loaded alpha and beta scalars\n";
-
-      builder.create<enzymexla::GemmOp>(
-          call.getLoc(),
-          A_memref,
-          B_memref,
-          alpha,
-          beta,
-          C_memref);
-
-      llvm::errs() << "Emitted enzymexla.linalg.gemm operation\n";
-
-      auto statusCode = builder.create<arith::ConstantOp>(
-          call.getLoc(),
-          builder.getI32Type(),
-          builder.getI32IntegerAttr(0));
-
-      call.replaceAllUsesWith(statusCode);
-      call.erase();
-
-      llvm::errs() << "Replaced cublasSgemm_v2 call with enzymexla.linalg.gemm\n";
-    }
-
     llvm::errs() << "=== BlasRaisingPass done ===\n";
-    llvm::errs().flush();
+    // llvm::errs().flush();
   }
 };
 
