@@ -427,7 +427,7 @@ def SymmOp: EnzymeXLA_Op<"lapack.symm", [Pure, SameOperandsAndResultElementType]
   }];
 }
 
-def GemmOp: EnzymeXLA_Op<"linalg.gemm", [Pure]> {
+def GemmOp: EnzymeXLA_Op<"linalg.gemm", []> {
   let summary = "General matrix multiply with alpha/beta scaling";
 
   let description = [{
