@@ -83,7 +83,7 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
   using namespace mlir;
   // clang-format off
   std::string pass_pipeline =
-      "print,inline{default-pipeline=canonicalize "
+      "inline{default-pipeline=canonicalize "
       "max-iterations=4},sroa-wrappers{set_private=false attributor=false},gpu-launch-"
       "recognition,canonicalize,libdevice-funcs-raise,canonicalize,symbol-dce,";
   
@@ -108,7 +108,7 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
       "canonicalize,sort-memory,";
   if (StringRef(backend).starts_with("xla")) {
     // The new pass should probably be around "raise-affine-to-stablehlo", and might even be rolled up into that pass
-      pass_pipeline += "print,blas-raise,print,raise-affine-to-stablehlo{prefer_while_raising=false "
+      pass_pipeline += "blas-raise,raise-affine-to-stablehlo{prefer_while_raising=false "
       "dump_failed_lockstep=true},print,canonicalize,arith-raise{stablehlo=true},"
       "symbol-dce";
       if (outfile.size() && getenv("EXPORT_REACTANT")) {
