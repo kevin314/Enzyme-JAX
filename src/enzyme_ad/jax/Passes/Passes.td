@@ -22,7 +22,8 @@ def BlasRaisingPass : Pass<"blas-raise"> {
     "enzymexla::EnzymeXLADialect",
     "mlir::LLVM::LLVMDialect",
     "memref::MemRefDialect",
-    "tensor::TensorDialect"
+    "tensor::TensorDialect",
+    "affine::AffineDialect",
   ];
 }
 

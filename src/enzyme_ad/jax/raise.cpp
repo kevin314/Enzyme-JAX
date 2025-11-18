@@ -83,7 +83,7 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
   using namespace mlir;
   // clang-format off
   std::string pass_pipeline =
-      "inline{default-pipeline=canonicalize "
+      "print,inline{default-pipeline=canonicalize "
       "max-iterations=4},sroa-wrappers{set_private=false attributor=false},gpu-launch-"
       "recognition,canonicalize,libdevice-funcs-raise,canonicalize,symbol-dce,";
   
