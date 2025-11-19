@@ -51,6 +51,20 @@ namespace enzyme {
 using namespace mlir;
 using namespace mlir::enzyme;
 
+#define GET_NEXT_ARG(NAME)                         \
+  Value NAME;                                      \
+  do {                                             \
+    if (constants.count(idx) > 0) {                \
+      NAME = constants.at(idx);                    \
+    } else {                                       \
+      NAME = args[tracker];                        \
+      outputs[idx] = NAME;                         \
+      tracker++;                                   \
+    }                                              \
+    idx++;                                         \
+  } while (0)
+
+
 namespace {
 
   // TODO: better input mapping, reshape 1D inputs to be 2D
@@ -78,6 +92,12 @@ struct BlasRaisingPass
     typeMap["cublasSGemm_v2"].push_back(f32); // beta
     typeMap["cublasSGemm_v2"].push_back(f32DynTensor2D); // C
     typeMap["cublasSGemm_v2"].push_back(i32); // ldc
+  }
+
+  
+  std::string getRaisedFuncName(const std::string &funcName) {
+      static uint64_t counter = 0;
+      return funcName + std::to_string(counter++);
   }
 
   SmallVector<Value> transformOperands(LLVM::CallOp call, StringRef name) {
@@ -145,22 +165,6 @@ struct BlasRaisingPass
     return vecInputTy.getElementType();
   }
 
-  Value makePairFromScalars(OpBuilder &builder, Location &loc, Value a, Value b) {
-    auto elemTy = cast<TensorType>(a.getType()).getElementType();
-    auto aTensor = stablehlo::ReshapeOp::create(
-      builder,
-      loc, RankedTensorType::get({1}, elemTy), a
-    );
-    auto bTensor = stablehlo::ReshapeOp::create(
-      builder,
-      loc, RankedTensorType::get({1}, elemTy), b
-    );
-
-    return stablehlo::ConcatenateOp::create(
-      builder, loc, RankedTensorType::get({2}, elemTy), ValueRange{aTensor, bTensor}, builder.getI64IntegerAttr(0)
-    );
-  }
-
   Value getIsEnum(OpBuilder &builder, Location &loc, Value tensorVal, SmallVector<int> enums) {
     auto i32Tensor = RankedTensorType::get({}, builder.getI32Type());
     auto cmp = [&](Value a, Value b) {
@@ -187,60 +191,83 @@ struct BlasRaisingPass
     return valCmp;
   }
 
+  Value makePairFromScalars(OpBuilder &builder, Location &loc, Value a, Value b) {
+    auto i64 = builder.getI64Type();
+    a.dump();
+    b.dump();
+    auto a64 = stablehlo::ConvertOp::create(builder, loc, RankedTensorType::get({}, i64), a);
+    auto b64 = stablehlo::ConvertOp::create(builder, loc, RankedTensorType::get({}, i64), b);
+
+    a64.dump();
+    b64.dump();
+    auto aTensor = stablehlo::ReshapeOp::create(
+      builder,
+      loc, RankedTensorType::get({1}, i64), a64
+    );
+    auto bTensor = stablehlo::ReshapeOp::create(
+      builder,
+      loc, RankedTensorType::get({1}, i64), b64
+    );
+    aTensor.dump();
+    bTensor.dump();
+    return stablehlo::ConcatenateOp::create(
+      builder, loc, RankedTensorType::get({2}, i64), ValueRange{aTensor, bTensor}, builder.getI64IntegerAttr(0)
+    );
+  }
+
   Value makeDynamicSlice(OpBuilder &builder, Location &loc, Value tensor, Value dim0, Value dim1) {
-    auto i32 = builder.getI32Type();
+    auto i32 = builder.getI64Type();
     auto i32DoubleTensor = RankedTensorType::get({2}, i32);
     // Type dynTensor = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, f32);
     Value zero_tensor = stablehlo::ConstantOp::create(
         builder,
         loc,
-        DenseIntElementsAttr::get(i32DoubleTensor, {0, 0})
+        DenseIntElementsAttr::get(i32DoubleTensor, {(int64_t) 0, (int64_t) 0})
       );
 
     Value one_tensor = stablehlo::ConstantOp::create(
         builder,
         loc,
-        DenseIntElementsAttr::get(i32DoubleTensor, {1, 1})
+        DenseIntElementsAttr::get(i32DoubleTensor, {(int64_t) 1, (int64_t) 1})
       );
-
+    
     auto limit_tensor = makePairFromScalars(builder, loc, dim0, dim1);
 
     return stablehlo::RealDynamicSliceOp::create(builder, loc, tensor.getType(), tensor, zero_tensor, limit_tensor, one_tensor);
+  }
+
+  Value makeDynamicUpdateSlice(OpBuilder &builder, Location &loc, Value orig, Value update, Value dim0, Value dim1) {
+    auto i32 = builder.getI64Type();
+    auto i32ZeroTensor = RankedTensorType::get({}, i32);
+    // Type dynTensor = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, f32);
+    Value zero_tensor = stablehlo::ConstantOp::create(
+        builder,
+        loc,
+        DenseIntElementsAttr::get(i32ZeroTensor, {(int64_t)0})
+      );
+
+    // auto limit_tensor = makePairFromScalars(builder, loc, dim0, dim1);
+
+    return stablehlo::DynamicUpdateSliceOp::create(builder, loc, orig.getType(), ValueRange{orig, update, zero_tensor, zero_tensor});
   }
 
   Value makeDynamicUnflatten(OpBuilder &builder, Location &loc, Value tensor, Value ldim) {
     Type inputTy = tensor.getType();              // tensor<?xf32>
     auto vecInputTy = cast<RankedTensorType>(inputTy);
     Type elemTy = vecInputTy.getElementType();
+    Type elemTensorTy = RankedTensorType::get({}, elemTy);
 
-    // --- Get total length ---
-    auto c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
-    Value total = builder.create<tensor::DimOp>(loc, tensor, c0);  // index type
+    Value total = stablehlo::GetDimensionSizeOp::create(builder, loc, tensor, 0);  // index type
 
-    // --- Extract scalar from ldim: tensor<i32> -> i32 ---
-    Value ldimScalar = builder.create<tensor::ExtractOp>(loc, ldim);
+    Value rest = builder.create<stablehlo::DivOp>(loc, total, ldim);
+    Value shape = makePairFromScalars(builder, loc, ldim, rest);
 
-    // --- Convert ldim to index ---
-    Value ldimAsIndex = builder.create<arith::IndexCastOp>(
-        loc, builder.getIndexType(), ldimScalar);
-
-    // --- Compute rest = total / ldim ---
-    Value rest = builder.create<arith::DivUIOp>(loc, total, ldimAsIndex);
-
-    // --- Build shape tensor<2xindex> ---
-    Value shape = builder.create<tensor::FromElementsOp>(
-        loc,
-        RankedTensorType::get({2}, builder.getIndexType()),
-        ValueRange{ldimAsIndex, rest}
-    );
-
-    // --- Result type: tensor<?x?xf32> ---
     auto resultTy = RankedTensorType::get(
         {ShapedType::kDynamic, ShapedType::kDynamic},
         elemTy);
 
-    // --- Perform reshape ---
-    return builder.create<tensor::ReshapeOp>(
+    return stablehlo::DynamicReshapeOp::create(
+      builder,
         loc,
         resultTy,
         tensor,
@@ -252,52 +279,53 @@ struct BlasRaisingPass
     Type elemType = getElemType(tensor);
     auto flatTy = RankedTensorType::get({ShapedType::kDynamic}, elemType);
 
-    // index constants
-    auto c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
-    auto c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
+    Value d0Size = stablehlo::GetDimensionSizeOp::create(builder, loc, tensor, 0);  // index type
+    Value d1Size = stablehlo::GetDimensionSizeOp::create(builder, loc, tensor, 1);  // index type
 
-    // dims
-    auto dim0 = builder.create<tensor::DimOp>(loc, tensor, c0);
-    auto dim1 = builder.create<tensor::DimOp>(loc, tensor, c1);
+    auto total = builder.create<stablehlo::MulOp>(loc, d0Size, d1Size);
 
-    // total size = dim0 * dim1
-    auto total = builder.create<arith::MulIOp>(loc, dim0, dim1);
-
+    auto total1D = stablehlo::ReshapeOp::create(
+      builder,
+      loc, RankedTensorType::get({1}, getElemType(d0Size)), total
+    );
     // shape tensor for 1D result
-    Value shape = builder.create<tensor::FromElementsOp>(loc, ValueRange{total});
-
     // reshape back to 1D
-    return builder.create<tensor::ReshapeOp>(
+    return builder.create<stablehlo::DynamicReshapeOp>(
         loc,
         flatTy,
         tensor,
-        shape
+        total1D
       );
-  }
-
-  Value makeDynamicUpdateSlice(OpBuilder &builder, Location &loc, Value orig, Value update, Value dim0, Value dim1) {
-    auto i32 = builder.getI32Type();
-    auto i32ZeroTensor = RankedTensorType::get({}, i32);
-    // Type dynTensor = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, f32);
-    Value zero_tensor = stablehlo::ConstantOp::create(
-        builder,
-        loc,
-        DenseIntElementsAttr::get(i32ZeroTensor, {0})
-      );
-
-    // auto limit_tensor = makePairFromScalars(builder, loc, dim0, dim1);
-
-    return stablehlo::DynamicUpdateSliceOp::create(builder, loc, orig.getType(), ValueRange{orig, update, zero_tensor, zero_tensor});
   }
 
 
   void replaceCublasSGemm_v2(LLVM::CallOp call) {
-    constexpr StringRef fnName = "raised_cublasSGemm_v2";
+    std::string fnName = getRaisedFuncName("raised_cublasSGemm_v2");
     auto module = call->getParentOfType<ModuleOp>();
-    func::FuncOp f = module.lookupSymbol<func::FuncOp>(fnName);
-    if (!f) {
-      llvm::errs() << "replacing function not found\n";
+    // auto origFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("cublasSgemm_v2");
+    // if (!origFunc) {
+    //   llvm::errs() << "replacing function not found\n";
+    // }
+
+    int i = 0;
+    std::map<int, Value> constants;
+    for (auto arg : call->getOperands()) {
+      if (i == 0) {
+        ++i;
+        continue; // skip cublasHandle arg
+      }
+      Attribute attr;
+      if (matchPattern(arg, m_Constant(&attr))) {
+        // llvm::errs() << "matches constant\n";
+        constants[i-1] = arg;
+      }
+      ++i;
     }
+    
+    func::FuncOp f = getCublasSGemm_v2(call, constants);
+
+    llvm::errs() << "replacing cublasSGemm\n";
+
     SmallVector<Value> newOperands = transformOperands(call, "cublasSGemm_v2");
 
     OpBuilder builder(call);
@@ -305,22 +333,22 @@ struct BlasRaisingPass
       builder, call->getLoc(), SymbolRefAttr::get(f),
       llvm::to_vector(newOperands), nullptr, nullptr);
     
-    // call.getResult().getType().dump();
   }
   // TODO: Handle differing leading dimensions
-  func::FuncOp getCublasSGemm_v2(LLVM::LLVMFuncOp func) {
+  func::FuncOp getCublasSGemm_v2(LLVM::CallOp call, std::map<int, Value> constants) {
     constexpr StringRef fnName = "raised_cublasSGemm_v2";
-    auto module = func->getParentOfType<ModuleOp>();
+    auto module = call->getParentOfType<ModuleOp>();
 
-    if (func::FuncOp existing =
-            module.lookupSymbol<func::FuncOp>(fnName)) {
-      llvm::errs() << "early exit\n";
-      return existing;
-    }
+    // if (func::FuncOp existing =
+    //         module.lookupSymbol<func::FuncOp>(fnName)) {
+    //   llvm::errs() << "early exit\n";
+    //   return existing;
+    // }
+    
 
-    MLIRContext *ctx = func.getContext();
+    MLIRContext *ctx = call.getContext();
     OpBuilder builder(ctx);
-    auto loc = func.getLoc();
+    auto loc = call.getLoc();
 
     auto f32 = builder.getF32Type();
     auto i32 = builder.getI32Type();
@@ -329,16 +357,15 @@ struct BlasRaisingPass
     Type i32Tensor = RankedTensorType::get({}, i32);
     Type f32Tensor = RankedTensorType::get({}, f32);
 
-    // original type
-    auto inputs = func.getArgumentTypes();
-    // auto results = func.getResultTypes();
-
-    // Construct new input type list excluding the first one
+    // Construct new input type list
+    
     SmallVector<Type> newInputs;
     SmallVector<Type> results;
 
-    for (int i = 0; i < inputs.size()-1; i++) {
-      if (i == 6 || i == 8 || i == 11) {
+    for (int i = 0; i < 13; i++) {
+      if (constants.count(i) > 0) {
+        // do nothing
+      } else if (i == 6 || i == 8 || i == 11) {
         newInputs.push_back(flatDynTensor);
         results.push_back(flatDynTensor);
       } else if (i == 5 || i == 10) {
@@ -355,7 +382,7 @@ struct BlasRaisingPass
       // return existing;
     
 
-    auto fn = func::FuncOp::create(func.getLoc(), fnName, newFuncType);
+    auto fn = func::FuncOp::create(loc, fnName, newFuncType);
     fn.setPrivate();
     module.push_back(fn);
 
@@ -364,22 +391,51 @@ struct BlasRaisingPass
 
     Block *entry = fn.addEntryBlock();
     OpBuilder bodyBuilder(entry, entry->begin());
+    
+    for (auto &entry : constants) {
+      Value &val = entry.second;   // mutable reference
+      auto unrankedTensorType = RankedTensorType::get({}, val.getType());
+      Attribute attr;
+      matchPattern(val, m_Constant(&attr));
+
+      val = stablehlo::ConstantOp::create(
+        bodyBuilder, val.getLoc(), unrankedTensorType,
+        SplatElementsAttr::get(
+            unrankedTensorType,
+            ArrayRef<Attribute>(attr)));
+    }
 
     // Extract arguments
     auto args = entry->getArguments();
-    Value transAenum = args[0];
-    Value transBenum = args[1];
-    Value m = args[2];
-    Value n = args[3];
-    Value k = args[4];
-    Value alpha = args[5];
-    Value A_flat = args[6];
-    Value lda = args[7];
-    Value B_flat = args[8];
-    Value ldb = args[9];
-    Value beta = args[10];
-    Value C_flat = args[11];
-    Value ldc = args[12];
+    int idx = 0;
+    int tracker = 0;
+    std::map<int, Value> outputs;
+
+    GET_NEXT_ARG(transAenum);
+    GET_NEXT_ARG(transBenum);
+    GET_NEXT_ARG(m);
+    GET_NEXT_ARG(n);
+    GET_NEXT_ARG(k);
+    GET_NEXT_ARG(alpha);
+    GET_NEXT_ARG(A_flat);
+    GET_NEXT_ARG(lda);
+    GET_NEXT_ARG(B_flat);
+    GET_NEXT_ARG(ldb);
+    GET_NEXT_ARG(beta);
+    GET_NEXT_ARG(C_flat);
+    GET_NEXT_ARG(ldc);
+
+    // Value m = args[2];
+    // Value n = args[3];
+    // Value k = args[4];
+    // Value alpha = args[5];
+    // Value A_flat = args[6];
+    // Value lda = args[7];
+    // Value B_flat = args[8];
+    // Value ldb = args[9];
+    // Value beta = args[10];
+    // Value C_flat = args[11];
+    // Value ldc = args[12];
 
     Value A = makeDynamicUnflatten(bodyBuilder, loc, A_flat, lda);
     Value B = makeDynamicUnflatten(bodyBuilder, loc, B_flat, ldb);
@@ -539,8 +595,14 @@ struct BlasRaisingPass
                                             scaledC);
     Value out2D = makeDynamicUpdateSlice(bodyBuilder, loc, C, update, m, n);
     Value outFlat = makeDynamicFlatten(bodyBuilder, loc, out2D);
+    
+    outputs.at(11) = outFlat;
 
-    func::ReturnOp::create(bodyBuilder, loc, ValueRange{transAenum, transBenum, m, n, k, alpha, A_flat, lda, B_flat, ldb, beta, outFlat, ldc});
+    SmallVector<Value> result;
+    for (auto &entry : outputs) {
+        result.push_back(entry.second);
+    }
+    func::ReturnOp::create(bodyBuilder, loc, ValueRange{result});
     return fn;
   }
 
@@ -550,23 +612,13 @@ struct BlasRaisingPass
     llvm::errs().flush();
     initializeInputMap(op->getContext());
 
-    op->walk([&](LLVM::LLVMFuncOp callOp) {
-      auto calleeName = callOp.getName();
-      if (calleeName == "cublasSgemm_v2") {
-        getCublasSGemm_v2(callOp);
-      }
-    });
-
-    // SmallVector<Value> oldCalls;
-    // op->walk([&](LLVM::CallOp callOp) {
-    //   llvm::StringRef calleeName = callOp.getCallee().value_or("");
-    //   llvm::errs() << "call: " << calleeName << "\n";
+    // op->walk([&](LLVM::LLVMFuncOp callOp) {
+    //   auto calleeName = callOp.getName();
     //   if (calleeName == "cublasSgemm_v2") {
-    //     llvm::errs() << "call found\n";
-    //     replaceCublasSGemm_v2(callOp);
-    //     oldCalls.push_back(callOp);
+    //     getCublasSGemm_v2(callOp);
     //   }
     // });
+
     SmallVector<LLVM::CallOp, 4> cublasCalls;
 
     op->walk([&](LLVM::CallOp callOp) {

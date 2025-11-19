@@ -116,8 +116,6 @@ struct SCFParallelSerializationPass
 
   void runOnOperation() override {
     auto m = getOperation();
-    llvm::errs() << "inside parallelSerialization pass\n";
-    m->dump();
     RewritePatternSet patterns(&getContext());
     patterns.insert<ParallelSerialization>(&getContext());
     GreedyRewriteConfig config;
@@ -125,8 +123,6 @@ struct SCFParallelSerializationPass
       signalPassFailure();
       return;
     }
-    llvm::errs() << "after parallelSerialization pass\n";
-    m->dump();
   }
 };
 

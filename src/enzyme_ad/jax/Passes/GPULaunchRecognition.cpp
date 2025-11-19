@@ -112,7 +112,7 @@ struct GPULaunchRecognitionPass
 
         auto res = gpu::AllocOp::create(
             builder, call.getLoc(),
-            MemRefType::get({ShapedType::kDynamic}, i8,
+            MemRefType::get({ShapedType::kDynamic}, builder.getF32Type(),
                             MemRefLayoutAttrInterface{},
                             builder.getI64IntegerAttr(1)),
             (mlir::Type) nullptr, ValueRange(), ValueRange(arg), ValueRange());
