@@ -107,7 +107,7 @@ struct BlasRaisingPass
       return funcName + std::to_string(counter++);
   }
 
-  SmallVector<Value> transformOperands(LLVM::CallOp call, StringRef name) {
+  SmallVector<Value> transformOperands(LLVM::CallOp call, std::map<int, Value> constants, StringRef name) {
     auto modOp = call->getParentOfType<ModuleOp>();
     OpBuilder builder(call);
     ArrayRef<Type> targetTypes(typeMap[name]);
@@ -120,6 +120,10 @@ struct BlasRaisingPass
       Value arg = *it;
       Type desiredType = targetTypes[idx];
 
+      if (constants.count(idx) != 0) {
+        newOperands.push_back(arg);
+        continue;
+      }
       // Largely copied from AffineToStableHLORaising.cpp
       // Is tensor, just convert to memref
       if (auto tensorType = dyn_cast<TensorType>(desiredType)) {
@@ -153,13 +157,13 @@ struct BlasRaisingPass
       affine::AffineStoreOp::create(builder, loc, arg, res0,
                                     builder.getMultiDimIdentityMap(0),
                                     ValueRange());
-      auto c1 = arith::ConstantIndexOp::create(builder, loc, 1);
+      auto c1 = arith::ConstantIndexOp::create(builder, loc, 4);
       enzymexla::MemcpyOp::create(builder, loc, (mlir::Type) nullptr,
                                   ValueRange(), res, res0, c1);
 
       builder.setInsertionPointAfter(call);
-      // gpu::DeallocOp::create(builder, loc, (mlir::Type) nullptr,
-      //                         ValueRange(), res);
+      gpu::DeallocOp::create(builder, loc, (mlir::Type) nullptr,
+                              ValueRange(), res);
       builder.setInsertionPoint(call);
       newOperands.push_back(res);
     }
@@ -304,7 +308,7 @@ struct BlasRaisingPass
 
     llvm::errs() << "replacing cublasSGemm\n";
 
-    SmallVector<Value> newOperands = transformOperands(call, "cublasSGemm_v2");
+    SmallVector<Value> newOperands = transformOperands(call, constants, "cublasSGemm_v2");
 
     for (int i = newOperands.size() - 1; i >= 0; --i) {
       if (constants.count(i) != 0) {
@@ -585,6 +589,12 @@ struct BlasRaisingPass
     Value update =
         bodyBuilder.create<stablehlo::AddOp>(loc, scaledDot.getType(), scaledDot,
                                             scaledC);
+    // auto tensorType = RankedTensorType::get({6}, builder.getF32Type());
+    // SmallVector<float> values = {(float) m_const, (float) k_const, (float) n_const, 1.0f, 1.0f, 1.0f};
+    // auto attr = DenseFPElementsAttr::get(tensorType, values);
+    // Value update = bodyBuilder.create<stablehlo::ConstantOp>(loc, tensorType, attr);
+    // Value update = C_sliced;
+    // Value update = betaBroadcast;
     Value outFlat = make1DTensor(bodyBuilder, loc, C_flat, update, ldc_const, m_const, n_const);
     
     outputs.at(11) = outFlat;

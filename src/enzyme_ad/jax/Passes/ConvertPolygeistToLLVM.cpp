@@ -2765,7 +2765,13 @@ private:
 
       auto xdata = insertXLAInitDeinit(moduleOp, backend, rewriter);
 
-      Value args[] = {xdata, ptr};
+      Value casted = LLVM::AddrSpaceCastOp::create(
+        rewriter,
+        loc,
+        LLVM::LLVMPointerType::get(rewriter.getContext(), 0),
+        ptr
+      );
+      Value args[] = {xdata, casted};
 
       LLVM::CallOp::create(rewriter, loc, xlaFreeFn.value(), args);
     } else {
