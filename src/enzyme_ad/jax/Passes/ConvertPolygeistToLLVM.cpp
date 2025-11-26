@@ -85,28 +85,48 @@ mlir::LLVM::LLVMFuncOp GetOrCreateFreeFunction(ModuleOp module);
 
 Type convertMemrefElementTypeForLLVMPointer(
     MemRefType type, const LLVMTypeConverter &converter) {
-  Type converted = converter.convertType(type.getElementType());
-  if (!converted)
-    return Type();
+  llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Converting: " << type << "\n";
 
+  // Safety check: ensure we actually have a MemRefType
+  if (!type) {
+    llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] ERROR: Not a MemRefType!\n";
+    return Type();
+  }
+
+  Type converted = converter.convertType(type.getElementType());
+  if (!converted) {
+    llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Failed to convert element type\n";
+    return Type();
+  }
+
+  llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Rank: " << type.getRank() << "\n";
   if (type.getRank() == 0) {
+    llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Rank 0, returning converted type\n";
     return converted;
   }
 
+  llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Checking dynamic dimensions\n";
   // Only the leading dimension can be dynamic.
-  if (llvm::any_of(type.getShape().drop_front(), ShapedType::isDynamic))
+  if (llvm::any_of(type.getShape().drop_front(), ShapedType::isDynamic)) {
+    llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Non-leading dynamic dimension found\n";
     return Type();
+  }
 
+  llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Checking layout identity\n";
   // Only identity layout is supported.
   // TODO: detect the strided layout that is equivalent to identity
   // given the static part of the shape.
-  if (!type.getLayout().isIdentity())
+  if (!type.getLayout().isIdentity()) {
+    llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Layout is not identity: " << type.getLayout() << "\n";
     return Type();
+  }
 
+  llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Building array type\n";
   if (type.getRank() > 0) {
     for (int64_t size : llvm::reverse(type.getShape().drop_front()))
       converted = LLVM::LLVMArrayType::get(converted, size);
   }
+  llvm::errs() << "[convertMemrefElementTypeForLLVMPointer] Success, returning: " << converted << "\n";
   return converted;
 }
 
@@ -277,11 +297,17 @@ struct Pointer2MemrefOpLowering
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
 
+    llvm::errs() << "[Pointer2MemrefOp] Lowering type: " << op.getType() << "\n";
+
     // MemRefDescriptor sourceMemRef(operands.front());
     auto convertedType = getTypeConverter()->convertType(op.getType());
     assert(convertedType && "unexpected failure in memref type conversion");
     auto space1 = op.getType().getMemorySpaceAsInt();
+
+    llvm::errs() << "[Pointer2MemrefOp] Converted to: " << convertedType << "\n";
+
     if (auto PT = dyn_cast<LLVM::LLVMPointerType>(convertedType)) {
+      llvm::errs() << "[Pointer2MemrefOp] -> C-style pointer\n";
       mlir::Value ptr = adaptor.getSource();
       if (space1 != cast<LLVM::LLVMPointerType>(op.getSource().getType())
                         .getAddressSpace())
@@ -290,6 +316,7 @@ struct Pointer2MemrefOpLowering
       return success();
     }
 
+    llvm::errs() << "[Pointer2MemrefOp] -> Creating descriptor (SHOULD NOT HAPPEN WITH C-STYLE)\n";
     auto descr = MemRefDescriptor::poison(rewriter, loc, convertedType);
     Value ptr = adaptor.getSource();
 
@@ -2405,6 +2432,8 @@ private:
 
     MemRefType memRefType = allocOp.getType();
 
+    llvm::errs() << "[gpu.alloc] Allocating: " << memRefType << " (backend: " << backend << ")\n";
+
     if (failed(areAllLLVMTypes(allocOp, adaptor.getOperands(), rewriter)) ||
         !isConvertibleAndHasIdentityMaps(memRefType))
       return failure();
@@ -2547,6 +2576,7 @@ private:
             LLVM::CallOp::create(rewriter, loc, xlaMallocFn.value(), args)
                 ->getResult(0);
 
+        // Cast to address space 1 to match expected memref type
         allocatedPtr =
             LLVM::AddrSpaceCastOp::create(rewriter, loc, ptr1ty, allocatedPtr);
 
@@ -2868,6 +2898,15 @@ private:
     }
     if (!baduser)
       rewriter.eraseOp(fn.getOperation());
+
+    // Replace wrapper results with inputs (XLA modifies inputs in-place)
+    // The results should be the same values as the inputs since XLA uses in/out semantics
+    // Use original inputs (not adapted), since downstream ops haven't been lowered yet
+    if (wrap.getNumResults() > 0) {
+      for (size_t i = 0; i < wrap.getNumResults() && i < wrap.getInputs().size(); i++) {
+        wrap.getResult(i).replaceAllUsesWith(wrap.getInputs()[i]);
+      }
+    }
 
     rewriter.eraseOp(wrap);
 

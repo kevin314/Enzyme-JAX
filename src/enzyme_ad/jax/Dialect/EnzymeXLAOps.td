@@ -218,6 +218,8 @@ def XLAWrapperOp : EnzymeXLA_Op<"xla_wrapper", [
     OptionalAttr<DictArrayAttr>:$res_attrs
   );
 
+  let results = (outs Variadic<AnyType>);
+
   let assemblyFormat = [{
     $fn ` ` `(` $inputs `)` attr-dict `:` functional-type($inputs, results)
   }];

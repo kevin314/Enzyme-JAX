@@ -107,7 +107,7 @@ struct BlasRaisingPass
       return funcName + std::to_string(counter++);
   }
 
-  SmallVector<Value> transformOperands(LLVM::CallOp call, StringRef name) {
+  SmallVector<Value> transformOperands(LLVM::CallOp call, StringRef name, std::map<int, Value> &constants) {
     auto modOp = call->getParentOfType<ModuleOp>();
     OpBuilder builder(call);
     ArrayRef<Type> targetTypes(typeMap[name]);
@@ -121,14 +121,119 @@ struct BlasRaisingPass
       Type desiredType = targetTypes[idx];
 
       // Largely copied from AffineToStableHLORaising.cpp
-      // Is tensor, just convert to memref
+      // Is tensor, allocate XLA GPU memory and copy CUDA data to it
       if (auto tensorType = dyn_cast<TensorType>(desiredType)) {
-        auto MT =
-            MemRefType::get(
-              {ShapedType::kDynamic},
-              tensorType.getElementType()
+        // Compute the buffer size for this tensor
+        // For cublasSGemm_v2: idx 6=A (m*k), idx 8=B (k*n), idx 11=C (m*n)
+        Value sizeVal;
+        int64_t staticSize = -1;  // -1 means dynamic
+
+        if (name == "cublasSGemm_v2") {
+          // Get m, n, k from constants (indices 2, 3, 4)
+          // Try to extract compile-time constant values
+          auto getConstantInt = [](Value v) -> std::optional<int64_t> {
+            Attribute attr;
+            if (matchPattern(v, m_Constant(&attr))) {
+              if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+                return intAttr.getInt();
+              }
+            }
+            return std::nullopt;
+          };
+
+          if (idx == 6) {  // A matrix: m * k
+            if (constants.count(2) && constants.count(4)) {
+              Value m = constants[2];
+              Value k = constants[4];
+              auto m_const = getConstantInt(m);
+              auto k_const = getConstantInt(k);
+              if (m_const && k_const) {
+                staticSize = (*m_const) * (*k_const);
+              }
+              Value m_idx = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), m);
+              Value k_idx = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), k);
+              sizeVal = builder.create<arith::MulIOp>(loc, m_idx, k_idx);
+            }
+          } else if (idx == 8) {  // B matrix: k * n
+            if (constants.count(3) && constants.count(4)) {
+              Value k = constants[4];
+              Value n = constants[3];
+              auto k_const = getConstantInt(k);
+              auto n_const = getConstantInt(n);
+              if (k_const && n_const) {
+                staticSize = (*k_const) * (*n_const);
+              }
+              Value k_idx = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), k);
+              Value n_idx = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), n);
+              sizeVal = builder.create<arith::MulIOp>(loc, k_idx, n_idx);
+            }
+          } else if (idx == 11) {  // C matrix: m * n
+            if (constants.count(2) && constants.count(3)) {
+              Value m = constants[2];
+              Value n = constants[3];
+              auto m_const = getConstantInt(m);
+              auto n_const = getConstantInt(n);
+              if (m_const && n_const) {
+                staticSize = (*m_const) * (*n_const);
+              }
+              Value m_idx = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), m);
+              Value n_idx = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), n);
+              sizeVal = builder.create<arith::MulIOp>(loc, m_idx, n_idx);
+            }
+          }
+        }
+
+        if (!sizeVal) {
+          llvm::errs() << "WARNING: Could not compute size for tensor at idx " << idx << "\n";
+          sizeVal = builder.create<arith::ConstantIndexOp>(loc, 0);
+          staticSize = 0;
+        }
+
+        // Allocate a new XLA buffer with the correct size
+        MemRefType MT_xla;
+        SmallVector<Value> dynamicSizes;
+        if (staticSize >= 0) {
+          MT_xla = MemRefType::get(
+              {staticSize},
+              tensorType.getElementType(),
+              MemRefLayoutAttrInterface{},
+              builder.getI64IntegerAttr(1)
             );
-        newOperands.push_back(enzymexla::Pointer2MemrefOp::create(builder, loc, MT, arg));
+          llvm::errs() << "Allocating new XLA buffer with size " << staticSize << " at idx " << idx << "\n";
+        } else {
+          MT_xla = MemRefType::get(
+              {ShapedType::kDynamic},
+              tensorType.getElementType(),
+              MemRefLayoutAttrInterface{},
+              builder.getI64IntegerAttr(1)
+            );
+          dynamicSizes.push_back(sizeVal);
+        }
+
+        auto xla_memref = gpu::AllocOp::create(builder, loc, MT_xla, (mlir::Type) nullptr,
+                              ValueRange(), dynamicSizes, ValueRange())
+            ->getResult(0);
+
+        // Create a dynamic memref from the source pointer for copying
+        // Use dynamic shape to avoid type conflicts
+        MemRefType MT_src_dynamic = MemRefType::get(
+            {ShapedType::kDynamic},
+            tensorType.getElementType(),
+            MemRefLayoutAttrInterface{},
+            builder.getI64IntegerAttr(1)
+          );
+        Value src_memref = enzymexla::Pointer2MemrefOp::create(builder, loc, MT_src_dynamic, arg);
+
+        // Convert element count to byte size (sizeof(f32) = 4)
+        Value elemSize = builder.create<arith::ConstantIndexOp>(loc, 4);
+        Value byteSizeVal = builder.create<arith::MulIOp>(loc, sizeVal, elemSize);
+
+        // Copy from the source (might be oversized) to the correctly-sized XLA buffer
+        // The byte size ensures we only copy the correct amount
+        enzymexla::MemcpyOp::create(builder, loc, (mlir::Type) nullptr,
+                                    ValueRange(), xla_memref, src_memref, byteSizeVal);
+
+        newOperands.push_back(xla_memref);
         continue;
       }
 
@@ -153,9 +258,12 @@ struct BlasRaisingPass
       affine::AffineStoreOp::create(builder, loc, arg, res0,
                                     builder.getMultiDimIdentityMap(0),
                                     ValueRange());
-      auto c1 = arith::ConstantIndexOp::create(builder, loc, 1);
+      // Compute byte size for scalar (element count * element size in bytes)
+      unsigned elemBitWidth = arg.getType().getIntOrFloatBitWidth();
+      unsigned elemByteSize = (elemBitWidth + 7) / 8;  // Round up to nearest byte
+      auto byteSize = arith::ConstantIndexOp::create(builder, loc, elemByteSize);
       enzymexla::MemcpyOp::create(builder, loc, (mlir::Type) nullptr,
-                                  ValueRange(), res, res0, c1);
+                                  ValueRange(), res, res0, byteSize);
 
       builder.setInsertionPointAfter(call);
       // gpu::DeallocOp::create(builder, loc, (mlir::Type) nullptr,
@@ -304,7 +412,21 @@ struct BlasRaisingPass
 
     llvm::errs() << "replacing cublasSGemm\n";
 
-    SmallVector<Value> newOperands = transformOperands(call, "cublasSGemm_v2");
+    // Before transforming, get the original C pointer operand
+    // cublasSgemm args: handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
+    // C is at operand index 12 (0-indexed)
+    Value orig_C_ptr = call.getOperand(12);
+
+    // Trace back to find the GPU memref: C_ptr came from memref2pointer(C_gpu_memref)
+    Value C_gpu_memref;
+    if (auto memref2ptr = orig_C_ptr.getDefiningOp<enzymexla::Memref2PointerOp>()) {
+      C_gpu_memref = memref2ptr.getSource();
+      llvm::errs() << "Found C GPU memref: " << C_gpu_memref << "\n";
+    } else {
+      llvm::errs() << "WARNING: Could not trace C back to GPU memref\n";
+    }
+
+    SmallVector<Value> newOperands = transformOperands(call, "cublasSGemm_v2", constants);
 
     for (int i = newOperands.size() - 1; i >= 0; --i) {
       if (constants.count(i) != 0) {
@@ -313,10 +435,55 @@ struct BlasRaisingPass
     }
 
     OpBuilder builder(call);
-    enzymexla::XLAWrapperOp::create(
-      builder, call->getLoc(), SymbolRefAttr::get(f),
+    // Get result types from function (all same as input types for in/out params)
+    SmallVector<Type> resultTypes;
+    for (auto operand : newOperands) {
+      resultTypes.push_back(operand.getType());
+    }
+
+    // Create the XLA wrapper operation
+    auto wrapperOp = enzymexla::XLAWrapperOp::create(
+      builder, call->getLoc(), TypeRange(resultTypes), SymbolRefAttr::get(f),
       llvm::to_vector(newOperands), nullptr, nullptr);
-    
+
+    llvm::errs() << "Created XLA wrapper for GEMM\n";
+    llvm::errs() << "  Wrapper has " << wrapperOp->getNumResults() << " results\n";
+    llvm::errs() << "  newOperands has " << newOperands.size() << " operands\n";
+
+    // Copy the result from XLA GPU memory back to the original CUDA GPU buffer
+    // Result #4 is the C matrix output (in XLA GPU memory, address space 1)
+    if (C_gpu_memref && wrapperOp->getNumResults() >= 5) {
+      builder.setInsertionPointAfter(wrapperOp);
+
+      // Compute C size: m * n elements, then convert to bytes
+      Value c_size_elements;
+      if (constants.count(2) && constants.count(3)) {
+        Value m = constants[2];
+        Value n = constants[3];
+        Value m_idx = arith::IndexCastOp::create(builder, call->getLoc(), builder.getIndexType(), m);
+        Value n_idx = arith::IndexCastOp::create(builder, call->getLoc(), builder.getIndexType(), n);
+        c_size_elements = builder.create<arith::MulIOp>(call->getLoc(), m_idx, n_idx);
+      } else {
+        c_size_elements = builder.create<arith::ConstantIndexOp>(call->getLoc(), 6);  // fallback: 2x3 = 6 elements
+      }
+
+      // Convert element count to byte size (sizeof(f32) = 4)
+      Value elemSize = builder.create<arith::ConstantIndexOp>(call->getLoc(), 4);
+      Value c_size_bytes = builder.create<arith::MulIOp>(call->getLoc(), c_size_elements, elemSize);
+
+      // Copy from XLA GPU memory (address space 1) to CUDA GPU memory (address space 1)
+      // This becomes direction=3 (device to device)
+      Value xla_result = wrapperOp->getResult(4);  // C output in XLA GPU memory (address space 1)
+      enzymexla::MemcpyOp::create(
+        builder, call->getLoc(), (mlir::Type)nullptr, ValueRange(),
+        C_gpu_memref,      // destination: CUDA GPU buffer (address space 1)
+        xla_result,        // source: XLA GPU buffer (address space 1)
+        c_size_bytes
+      );
+
+      llvm::errs() << "Added memcpy from XLA GPU result to CUDA GPU buffer\n";
+    }
+
   }
   // TODO: Handle differing leading dimensions
   func::FuncOp getCublasSGemm_v2(LLVM::CallOp call, std::map<int, Value> constants) {
@@ -341,7 +508,7 @@ struct BlasRaisingPass
     Type f32Tensor = RankedTensorType::get({}, f32);
 
     // Construct new input type list
-    
+
     SmallVector<Type> newInputs;
     SmallVector<Type> results;
 
@@ -550,7 +717,7 @@ struct BlasRaisingPass
     // STEP 3: alpha * dot + beta * C
     // Scale dot
     Value broadcastSize = makePairFromScalars(bodyBuilder, loc, m, n);
-    llvm::ArrayRef<int64_t> b_dims = {0, 1};
+    SmallVector<int64_t> b_dims = {0, 1};
     auto b_dimsAttr = mlir::DenseI64ArrayAttr::get(ctx, b_dims);
     auto alphaTensor = stablehlo::ReshapeOp::create(
       bodyBuilder, loc, RankedTensorType::get({1, 1}, f32), alpha
