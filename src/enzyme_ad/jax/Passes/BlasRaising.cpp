@@ -443,25 +443,44 @@ struct BlasRaisingPass
     // Value transA = getIsEnum(bodyBuilder, loc, transAenum, transposeEnums);
     // Value transB = getIsEnum(bodyBuilder, loc, transBenum, transposeEnums);
 
+    // Column-major matrix in memory has same layout as row-major transpose
+    // So column-major A[m,k] = row-major A^T[k,m] when reshaped
+    // make2DTensor slices ldim*cols elements, reshapes to [ldim, cols], slices to [rows, cols]
+    // For A: want row-major [k,m], so pass ldim=k, rows=k, cols=m
     Value A_eff;
     if (transA) {
-      auto A = make2DTensor(bodyBuilder, loc, A_flat, lda_const, k_const, m_const);
-      A_eff = stablehlo::TransposeOp::create(
-        bodyBuilder, loc, RankedTensorType::get({m_const, k_const}, elemTy), A, SmallVector<int64_t>{1, 0}
-      );
-    } else {
+      // transA: column-major is A^T[k,m], so row-major is A[m,k]
       A_eff = make2DTensor(bodyBuilder, loc, A_flat, lda_const, m_const, k_const);
+    } else {
+      // Normal: column-major A[m,k], so row-major is A^T[k,m]
+      // ldim*cols = k*m, reshape to [k,m], slice to [k,m]
+      // But make2DTensor uses ldim as first reshape dim, so use ldim=m
+      Type elemTy = getElemType(A_flat);
+      auto ctx = bodyBuilder.getContext();
+      auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
+        RankedTensorType::get({m_const * k_const}, elemTy), A_flat,
+        DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
+        DenseI64ArrayAttr::get(ctx, {m_const * k_const}),
+        DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
+      A_eff = stablehlo::ReshapeOp::create(bodyBuilder, loc,
+        RankedTensorType::get({k_const, m_const}, elemTy), sliced);
     }
 
-
     Value B_eff;
-    if (transA) {
-      auto B = make2DTensor(bodyBuilder, loc, B_flat, ldb_const, n_const, k_const);
-      B_eff = stablehlo::TransposeOp::create(
-        bodyBuilder, loc, RankedTensorType::get({k_const, n_const}, elemTy), B_flat, SmallVector<int64_t>{1, 0}
-      );
-    } else {
+    if (transB) {
+      // transB: column-major is B^T[n,k], so row-major is B[k,n]
       B_eff = make2DTensor(bodyBuilder, loc, B_flat, ldb_const, k_const, n_const);
+    } else {
+      // Normal: column-major B[k,n], so row-major is B^T[n,k]
+      Type elemTy = getElemType(B_flat);
+      auto ctx = bodyBuilder.getContext();
+      auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
+        RankedTensorType::get({k_const * n_const}, elemTy), B_flat,
+        DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
+        DenseI64ArrayAttr::get(ctx, {k_const * n_const}),
+        DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
+      B_eff = stablehlo::ReshapeOp::create(bodyBuilder, loc,
+        RankedTensorType::get({n_const, k_const}, elemTy), sliced);
     }
     // Value A_sliced = makeDynamicSlice(bodyBuilder, loc, A, m_const, k_const);
     // Value B_sliced = makeDynamicSlice(bodyBuilder, loc, B, k_const, n_const);
@@ -533,28 +552,36 @@ struct BlasRaisingPass
     // Mixed batch dims are empty; contracting dimension is {1}.
     // auto resultType = UnrankedTensorType::get(f32);
 
+    // cuBLAS uses column-major, StableHLO uses row-major
+    // Column-major: C(m,n) = A(m,k) * B(k,n)
+    // Row-major: C_row(n,m) = B_row(n,k) * A_row(k,m)
+    // A_eff is now [k, m] and B_eff is now [n, k]
+    // Compute B_eff[n,k] * A_eff[k,m] = [n,m]
+    // This [n,m] row-major result corresponds to [m,n] column-major output
     auto dotDimNumbers = stablehlo::DotDimensionNumbersAttr::get(
         bodyBuilder.getContext(),
         /*lhsBatchingDims=*/{},
         /*rhsBatchingDims=*/{},
-        /*lhsContractingDims=*/{1},
-        /*rhsContractingDims=*/{0}
+        /*lhsContractingDims=*/{1},  // B_eff[n,k] contracts on dim 1 (k)
+        /*rhsContractingDims=*/{0}   // A_eff[k,m] contracts on dim 0 (k)
       );
 
     Value dot =
         stablehlo::DotGeneralOp::create(
             bodyBuilder,
-            loc, RankedTensorType::get({m_const, n_const}, elemTy), A_eff, B_eff,
+            loc, RankedTensorType::get({n_const, m_const}, elemTy), B_eff, A_eff,
             dotDimNumbers, nullptr, nullptr);
+
     // Value dot = builder.create<stablehlo::DotGeneralOp>(
     //     loc, resultType, A, B, dotDimNumbers,
     //     nullptr,  // precision_config
     //     nullptr); // algorithm
 
     // STEP 3: alpha * dot + beta * C
+    // All operations are in row-major [n, m] space
     // Scale dot
-    Value broadcastSize = makePairFromScalars(bodyBuilder, loc, m, n);
-    llvm::ArrayRef<int64_t> b_dims = {0, 1};
+    Value broadcastSize = makePairFromScalars(bodyBuilder, loc, n, m);
+    SmallVector<int64_t> b_dims = {0, 1};
     auto b_dimsAttr = mlir::DenseI64ArrayAttr::get(ctx, b_dims);
     auto alphaTensor = stablehlo::ReshapeOp::create(
       bodyBuilder, loc, RankedTensorType::get({1, 1}, f32), alpha
@@ -568,9 +595,14 @@ struct BlasRaisingPass
       dot,
       alphaBroadcast);
 
-    // Slice C to correct [m,n] shape
-    // Value C_sliced = buildSlice(C, m, n, ldc);
-    Value C_sliced = make2DTensor(bodyBuilder, loc, C_flat, ldc_const, m_const, n_const);
+    // C: column-major [m,n] = row-major [n,m] when reshaped
+    auto C_sliced_1d = stablehlo::SliceOp::create(bodyBuilder, loc,
+      RankedTensorType::get({m_const * n_const}, elemTy), C_flat,
+      DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
+      DenseI64ArrayAttr::get(ctx, {m_const * n_const}),
+      DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
+    Value C_sliced = stablehlo::ReshapeOp::create(bodyBuilder, loc,
+      RankedTensorType::get({n_const, m_const}, elemTy), C_sliced_1d);
 
     // Scale C
     auto betaTensor = stablehlo::ReshapeOp::create(
@@ -595,7 +627,14 @@ struct BlasRaisingPass
     // Value update = bodyBuilder.create<stablehlo::ConstantOp>(loc, tensorType, attr);
     // Value update = C_sliced;
     // Value update = betaBroadcast;
-    Value outFlat = make1DTensor(bodyBuilder, loc, C_flat, update, ldc_const, m_const, n_const);
+    // Result is row-major [n,m] which has same memory layout as column-major [m,n]
+    // Just flatten and write back
+    Value outFlat = stablehlo::ReshapeOp::create(bodyBuilder, loc,
+      RankedTensorType::get({n_const * m_const}, elemTy), update);
+    Value zero_i64 = stablehlo::ConstantOp::create(bodyBuilder, loc,
+      DenseIntElementsAttr::get(RankedTensorType::get({}, bodyBuilder.getI64Type()), {(int64_t)0}));
+    outFlat = stablehlo::DynamicUpdateSliceOp::create(bodyBuilder, loc,
+      C_flat.getType(), ValueRange{C_flat, outFlat, zero_i64});
     
     outputs.at(11) = outFlat;
 
