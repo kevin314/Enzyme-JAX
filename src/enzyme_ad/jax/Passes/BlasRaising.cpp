@@ -382,19 +382,25 @@ struct BlasRaisingPass
     // Value transB = getIsEnum(bodyBuilder, loc, transBenum, transposeEnums);
 
     // Column-major matrix in memory has same layout as row-major transpose
-    // So column-major A[m,k] = row-major A^T[k,m] when reshaped
-    // make2DTensor slices ldim*cols elements, reshapes to [ldim, cols], slices to [rows, cols]
-    // For A: want row-major [k,m], so pass ldim=k, rows=k, cols=m
+    // When transA=false: A is [m,k] column-major = [k,m] row-major
+    // When transA=true: A is [k,m] column-major = [m,k] row-major
+
     Value A_eff;
     if (transA) {
-      // transA: column-major is A^T[k,m], so row-major is A[m,k]
-      A_eff = make2DTensor(bodyBuilder, loc, A_flat, lda_const, m_const, k_const);
+      // matrix is [k,m] column-major, becomes [m,k] row-major
+      // Then transpose to [k,m] for the row-major computation
+      auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
+        RankedTensorType::get({k_const * m_const}, elemTy), A_flat,
+        DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
+        DenseI64ArrayAttr::get(ctx, {k_const * m_const}),
+        DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
+      auto A_reshaped = stablehlo::ReshapeOp::create(bodyBuilder, loc,
+        RankedTensorType::get({m_const, k_const}, elemTy), sliced);
+      A_eff = stablehlo::TransposeOp::create(bodyBuilder, loc,
+        RankedTensorType::get({k_const, m_const}, elemTy),
+        A_reshaped, SmallVector<int64_t>{1, 0});
     } else {
-      // Normal: column-major A[m,k], so row-major is A^T[k,m]
-      // ldim*cols = k*m, reshape to [k,m], slice to [k,m]
-      // But make2DTensor uses ldim as first reshape dim, so use ldim=m
-      Type elemTy = getElemType(A_flat);
-      auto ctx = bodyBuilder.getContext();
+      // matrix is [m,k] column-major, becomes [k,m] row-major
       auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
         RankedTensorType::get({m_const * k_const}, elemTy), A_flat,
         DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
@@ -406,12 +412,20 @@ struct BlasRaisingPass
 
     Value B_eff;
     if (transB) {
-      // transB: column-major is B^T[n,k], so row-major is B[k,n]
-      B_eff = make2DTensor(bodyBuilder, loc, B_flat, ldb_const, k_const, n_const);
+      // matrix is [n,k] column-major, becomes [k,n] row-major
+      // Then transpose to [n,k] for the row-major computation
+      auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
+        RankedTensorType::get({n_const * k_const}, elemTy), B_flat,
+        DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
+        DenseI64ArrayAttr::get(ctx, {n_const * k_const}),
+        DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
+      auto B_reshaped = stablehlo::ReshapeOp::create(bodyBuilder, loc,
+        RankedTensorType::get({k_const, n_const}, elemTy), sliced);
+      B_eff = stablehlo::TransposeOp::create(bodyBuilder, loc,
+        RankedTensorType::get({n_const, k_const}, elemTy),
+        B_reshaped, SmallVector<int64_t>{1, 0});
     } else {
-      // Normal: column-major B[k,n], so row-major is B^T[n,k]
-      Type elemTy = getElemType(B_flat);
-      auto ctx = bodyBuilder.getContext();
+      // matrix is [k,n] column-major, becomes [n,k] row-major
       auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
         RankedTensorType::get({k_const * n_const}, elemTy), B_flat,
         DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
