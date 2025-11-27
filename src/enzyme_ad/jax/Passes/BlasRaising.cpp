@@ -51,19 +51,9 @@ namespace enzyme {
 using namespace mlir;
 using namespace mlir::enzyme;
 
-#define GET_NEXT_ARG(NAME)                         \
-  Value NAME;                                      \
-  do {                                             \
-    if (constants.count(idx) > 0) {                \
-      NAME = constants.at(idx);                    \
-    } else {                                       \
-      NAME = args[tracker];                        \
-      outputs[idx] = NAME;                         \
-      tracker++;                                   \
-    }                                              \
-    idx++;                                         \
-  } while (0)
-
+#define CUBLAS_OP_N (0)
+#define CUBLAS_OP_T (1)
+#define CUBLAS_OP_C (2)
 
 namespace {
 
@@ -72,58 +62,59 @@ struct BlasRaisingPass
     : public enzyme::impl::BlasRaisingPassBase<BlasRaisingPass> {
   using BlasRaisingPassBase::BlasRaisingPassBase;
 
-  // struct MatrixArgsIdx {
-  //   int64_t memref;
-  //   int64_t num_rows;
-  //   int64_t num_cols;
-  //   int64_t ldim;
-  //   int64_t op_enum;
-  // };
-  llvm::StringMap<std::vector<Type>> typeMap;
+  struct ValueWrapper {
+    Value val;
+    bool isConst;
+  };
+
+  using CublasConstructor = std::function<func::FuncOp(LLVM::CallOp, SmallVector<ValueWrapper>, func::FuncOp)>;
+
+  llvm::StringMap<SmallVector<Type>> typeMap;
   void initializeInputMap(MLIRContext *ctx) {
     Type i32 = IntegerType::get(ctx, 32);
     Type f32 = Float32Type::get(ctx);
     Type f32DynTensor2D = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, f32);
 
-    // cublasSGemm_v2
-    typeMap["cublasSGemm_v2"].push_back(i32); // transA
-    typeMap["cublasSGemm_v2"].push_back(i32); // transB
-    typeMap["cublasSGemm_v2"].push_back(i32); // m
-    typeMap["cublasSGemm_v2"].push_back(i32); // n
-    typeMap["cublasSGemm_v2"].push_back(i32); // k
-    typeMap["cublasSGemm_v2"].push_back(f32); // alpha
-    typeMap["cublasSGemm_v2"].push_back(f32DynTensor2D); // A
-    typeMap["cublasSGemm_v2"].push_back(i32); // lda
-    typeMap["cublasSGemm_v2"].push_back(f32DynTensor2D); // B
-    typeMap["cublasSGemm_v2"].push_back(i32); // ldb
-    typeMap["cublasSGemm_v2"].push_back(f32); // beta
-    typeMap["cublasSGemm_v2"].push_back(f32DynTensor2D); // C
-    typeMap["cublasSGemm_v2"].push_back(i32); // ldc
+    // cublasSgemm_v2
+    typeMap["cublasSgemm_v2"].push_back(i32); // transA
+    typeMap["cublasSgemm_v2"].push_back(i32); // transB
+    typeMap["cublasSgemm_v2"].push_back(i32); // m
+    typeMap["cublasSgemm_v2"].push_back(i32); // n
+    typeMap["cublasSgemm_v2"].push_back(i32); // k
+    typeMap["cublasSgemm_v2"].push_back(f32); // alpha
+    typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // A
+    typeMap["cublasSgemm_v2"].push_back(i32); // lda
+    typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // B
+    typeMap["cublasSgemm_v2"].push_back(i32); // ldb
+    typeMap["cublasSgemm_v2"].push_back(f32); // beta
+    typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // C
+    typeMap["cublasSgemm_v2"].push_back(i32); // ldc
   }
-
   
-  std::string getRaisedFuncName(const std::string &funcName) {
-      static uint64_t counter = 0;
-      return funcName + std::to_string(counter++);
+  StringRef getRaisedFuncName(StringRef funcName) {
+    static uint64_t counter = 0;
+    return StringRef(funcName.str() + std::to_string(counter++));
   }
 
-  SmallVector<Value> transformOperands(LLVM::CallOp call, std::map<int, Value> constants, StringRef name) {
+  SmallVector<ValueWrapper> transformOperands(LLVM::CallOp call, StringRef name) {
     auto modOp = call->getParentOfType<ModuleOp>();
     OpBuilder builder(call);
-    ArrayRef<Type> targetTypes(typeMap[name]);
     Location loc = call.getLoc();
 
-    SmallVector<Value> newOperands;
+    SmallVector<Type> targetTypes(typeMap[name.str()]);
+    SmallVector<ValueWrapper> newOperands;
     int idx = 0;
     for (auto it = std::next(call.getOperands().begin());
         it != call.getOperands().end(); ++it, ++idx) {
       Value arg = *it;
       Type desiredType = targetTypes[idx];
 
-      if (constants.count(idx) != 0) {
-        newOperands.push_back(arg);
+      Attribute attr;
+      if (matchPattern(arg, m_Constant(&attr))) {
+        newOperands.push_back(ValueWrapper{arg, true});
         continue;
       }
+
       // Largely copied from AffineToStableHLORaising.cpp
       // Is tensor, just convert to memref
       if (auto tensorType = dyn_cast<TensorType>(desiredType)) {
@@ -132,7 +123,7 @@ struct BlasRaisingPass
               {ShapedType::kDynamic},
               tensorType.getElementType()
             );
-        newOperands.push_back(enzymexla::Pointer2MemrefOp::create(builder, loc, MT, arg));
+        newOperands.push_back(ValueWrapper{enzymexla::Pointer2MemrefOp::create(builder, loc, MT, arg), false});
         continue;
       }
 
@@ -157,6 +148,7 @@ struct BlasRaisingPass
       affine::AffineStoreOp::create(builder, loc, arg, res0,
                                     builder.getMultiDimIdentityMap(0),
                                     ValueRange());
+      // TODO: add check for size of datatype, and set 4 to instead be that size
       auto c1 = arith::ConstantIndexOp::create(builder, loc, 4);
       enzymexla::MemcpyOp::create(builder, loc, (mlir::Type) nullptr,
                                   ValueRange(), res, res0, c1);
@@ -165,7 +157,7 @@ struct BlasRaisingPass
       gpu::DeallocOp::create(builder, loc, (mlir::Type) nullptr,
                               ValueRange(), res);
       builder.setInsertionPoint(call);
-      newOperands.push_back(res);
+      newOperands.push_back(ValueWrapper{res, false});
     }
     return newOperands;
   }
@@ -272,157 +264,103 @@ struct BlasRaisingPass
 
     Value flattened =
         stablehlo::ReshapeOp::create(builder, loc, RankedTensorType::get({num_rows*num_cols}, elemTy), update);
-    // auto limit_tensor = makePairFromScalars(builder, loc, dim0, dim1);
 
-    auto updated2D = stablehlo::DynamicUpdateSliceOp::create(builder, loc, orig.getType(), ValueRange{orig, flattened, zero_tensor});
-
-
-
-    return updated2D;
+    return stablehlo::DynamicUpdateSliceOp::create(builder, loc, orig.getType(), ValueRange{orig, flattened, zero_tensor});
   }
 
-  void replaceCublasSGemm_v2(LLVM::CallOp call) {
-    std::string fnName = getRaisedFuncName("raised_cublasSGemm_v2");
-    auto module = call->getParentOfType<ModuleOp>();
-    // auto origFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("cublasSgemm_v2");
-    // if (!origFunc) {
-    //   llvm::errs() << "replacing function not found\n";
-    // }
-
-    int i = 0;
-    std::map<int, Value> constants;
-    for (auto arg : call->getOperands()) {
-      if (i == 0) {
-        ++i;
-        continue; // skip cublasHandle arg
-      }
-      Attribute attr;
-      if (matchPattern(arg, m_Constant(&attr))) {
-        // llvm::errs() << "matches constant\n";
-        constants[i-1] = arg;
-      }
-      ++i;
-    }
-    
-    func::FuncOp f = getCublasSGemm_v2(call, constants);
-
-    llvm::errs() << "replacing cublasSGemm\n";
-
-    SmallVector<Value> newOperands = transformOperands(call, constants, "cublasSGemm_v2");
-
-    for (int i = newOperands.size() - 1; i >= 0; --i) {
-      if (constants.count(i) != 0) {
-        newOperands.erase(newOperands.begin() + i);
-      }
-    }
-
-    OpBuilder builder(call);
-    enzymexla::XLAWrapperOp::create(
-      builder, call->getLoc(), SymbolRefAttr::get(f),
-      llvm::to_vector(newOperands), nullptr, nullptr);
-    
-  }
-  // TODO: Handle differing leading dimensions
-  func::FuncOp getCublasSGemm_v2(LLVM::CallOp call, std::map<int, Value> constants) {
-    constexpr StringRef fnName = "raised_cublasSGemm_v2";
-    auto module = call->getParentOfType<ModuleOp>();
-
-    // if (func::FuncOp existing =
-    //         module.lookupSymbol<func::FuncOp>(fnName)) {
-    //   llvm::errs() << "early exit\n";
-    //   return existing;
-    // }
-    
-
+  void replaceCall(LLVM::CallOp call, CublasConstructor constructor, StringRef name) {
     MLIRContext *ctx = call.getContext();
-    OpBuilder builder(ctx);
     auto loc = call.getLoc();
+    auto module = call->getParentOfType<ModuleOp>();
 
-    auto f32 = builder.getF32Type();
-    auto i32 = builder.getI32Type();
-    Type flatDynTensor = RankedTensorType::get({ShapedType::kDynamic}, f32);
-    Type i32Tensor = RankedTensorType::get({}, i32);
-    Type f32Tensor = RankedTensorType::get({}, f32);
+    StringRef fnName = getRaisedFuncName(name);
 
-    // Construct new input type list
-    
+    // transform operands
+    SmallVector<ValueWrapper> operands = transformOperands(call, StringRef(name));
+
+    // Construct new function type
     SmallVector<Type> newInputs;
-    SmallVector<Type> results;
-
-    for (int i = 0; i < 13; i++) {
-      if (constants.count(i) > 0) {
-        // do nothing
-      } else if (i == 6 || i == 8 || i == 11) {
-        newInputs.push_back(flatDynTensor);
-        results.push_back(flatDynTensor);
-      } else if (i == 5 || i == 10) {
-        newInputs.push_back(f32Tensor);
-        results.push_back(f32Tensor);
-      } else {
-        newInputs.push_back(i32Tensor);
-        results.push_back(i32Tensor);
+    for (auto &value_wrapper : operands) {
+      if (!value_wrapper.isConst) {
+        auto argTy = cast<MemRefType>(value_wrapper.val.getType());
+        newInputs.push_back(RankedTensorType::get(argTy.getShape(), argTy.getElementType()));
       }
     }
-
-    // Create new function type
+    SmallVector<Type> results(newInputs);
     auto newFuncType = mlir::FunctionType::get(ctx, newInputs, results);
-      // return existing;
-    
 
+    // Construct new function
     auto fn = func::FuncOp::create(loc, fnName, newFuncType);
     fn.setPrivate();
     module.push_back(fn);
 
+    // fill in function with corresponding constructor
+    func::FuncOp f = constructor(call, operands, fn);
 
-    // Construct replacement function
+    // create call to new function
+    SmallVector<Value> args;
+    for (auto value_wrapper : operands) {
+      if (!value_wrapper.isConst) {
+        args.push_back(value_wrapper.val);
+      }
+    }
+    OpBuilder builder(call);
+    enzymexla::XLAWrapperOp::create(
+      builder, call->getLoc(), SymbolRefAttr::get(f),
+      llvm::to_vector(args), nullptr, nullptr);
+    
+  }
+
+  SmallVector<Value> makeArgs(OpBuilder builder, Location loc, mlir::Block *entry, SmallVector<ValueWrapper> operands) {
+    // Merge passed args and constants into one array
+    auto args = entry->getArguments();
+    SmallVector<Value> allArgs;
+    int argIdx = 0;
+    for (auto &value_wrapper : operands) {
+      if (value_wrapper.isConst) {
+        auto unrankedTensorType = RankedTensorType::get({}, value_wrapper.val.getType());
+        Attribute attr;
+        matchPattern(value_wrapper.val, m_Constant(&attr));
+
+        allArgs.push_back(stablehlo::ConstantOp::create(
+          builder, value_wrapper.val.getLoc(), unrankedTensorType,
+          SplatElementsAttr::get(
+              unrankedTensorType,
+              ArrayRef<Attribute>(attr))
+          ));
+      } else {
+        allArgs.push_back(args[argIdx]);
+        ++argIdx;
+      }
+    }
+    return allArgs;
+  }
+
+  func::FuncOp getCublasSGemm_v2(LLVM::CallOp call, SmallVector<ValueWrapper> operands, func::FuncOp fn) {
+    auto module = call->getParentOfType<ModuleOp>();
+    auto loc = call.getLoc();
+    auto ctx = call.getContext();
 
     Block *entry = fn.addEntryBlock();
     OpBuilder bodyBuilder(entry, entry->begin());
-    
-    for (auto &entry : constants) {
-      Value &val = entry.second;   // mutable reference
-      auto unrankedTensorType = RankedTensorType::get({}, val.getType());
-      Attribute attr;
-      matchPattern(val, m_Constant(&attr));
-
-      val = stablehlo::ConstantOp::create(
-        bodyBuilder, val.getLoc(), unrankedTensorType,
-        SplatElementsAttr::get(
-            unrankedTensorType,
-            ArrayRef<Attribute>(attr)));
-    }
-
+  
     // Extract arguments
-    auto args = entry->getArguments();
-    int idx = 0;
-    int tracker = 0;
-    std::map<int, Value> outputs;
+    SmallVector<Value> allArgs(makeArgs(bodyBuilder, loc, entry, operands));
+    int i = 0;
+    Value transAenum = allArgs[i++];
+    Value transBenum = allArgs[i++];
+    Value m = allArgs[i++];
+    Value n = allArgs[i++];
+    Value k = allArgs[i++];
+    Value alpha = allArgs[i++];
+    Value A_flat = allArgs[i++];
+    Value lda = allArgs[i++];
+    Value B_flat = allArgs[i++];
+    Value ldb = allArgs[i++];
+    Value beta = allArgs[i++];
+    Value C_flat = allArgs[i++];
+    Value ldc = allArgs[i++];
 
-    GET_NEXT_ARG(transAenum);
-    GET_NEXT_ARG(transBenum);
-    GET_NEXT_ARG(m);
-    GET_NEXT_ARG(n);
-    GET_NEXT_ARG(k);
-    GET_NEXT_ARG(alpha);
-    GET_NEXT_ARG(A_flat);
-    GET_NEXT_ARG(lda);
-    GET_NEXT_ARG(B_flat);
-    GET_NEXT_ARG(ldb);
-    GET_NEXT_ARG(beta);
-    GET_NEXT_ARG(C_flat);
-    GET_NEXT_ARG(ldc);
-
-    // Value m = args[2];
-    // Value n = args[3];
-    // Value k = args[4];
-    // Value alpha = args[5];
-    // Value A_flat = args[6];
-    // Value lda = args[7];
-    // Value B_flat = args[8];
-    // Value ldb = args[9];
-    // Value beta = args[10];
-    // Value C_flat = args[11];
-    // Value ldc = args[12];
     Type elemTy = getElemType(A_flat);
 
     int64_t m_const = getConstantValue(m);
@@ -437,7 +375,7 @@ struct BlasRaisingPass
 
 
     // If transA or transB matches any of these enums, take the transpose
-    SmallVector<int64_t> transposeEnums = {'T', 't', 'C', 'c'};
+    SmallVector<int64_t> transposeEnums = {1, 2};
     bool transA = llvm::is_contained(transposeEnums, transAenum_const);
     bool transB = llvm::is_contained(transposeEnums, transBenum_const);
     // Value transA = getIsEnum(bodyBuilder, loc, transAenum, transposeEnums);
@@ -584,7 +522,7 @@ struct BlasRaisingPass
     SmallVector<int64_t> b_dims = {0, 1};
     auto b_dimsAttr = mlir::DenseI64ArrayAttr::get(ctx, b_dims);
     auto alphaTensor = stablehlo::ReshapeOp::create(
-      bodyBuilder, loc, RankedTensorType::get({1, 1}, f32), alpha
+      bodyBuilder, loc, RankedTensorType::get({1, 1}, getElemType(alpha)), alpha
     );
     Value alphaBroadcast = stablehlo::BroadcastInDimOp::create(
         bodyBuilder,
@@ -606,7 +544,7 @@ struct BlasRaisingPass
 
     // Scale C
     auto betaTensor = stablehlo::ReshapeOp::create(
-      bodyBuilder, loc, RankedTensorType::get({1, 1}, f32), beta
+      bodyBuilder, loc, RankedTensorType::get({1, 1}, getElemType(beta)), beta
     );
     Value betaBroadcast = stablehlo::DynamicBroadcastInDimOp::create(
         bodyBuilder,
@@ -621,12 +559,6 @@ struct BlasRaisingPass
     Value update =
         bodyBuilder.create<stablehlo::AddOp>(loc, scaledDot.getType(), scaledDot,
                                             scaledC);
-    // auto tensorType = RankedTensorType::get({6}, builder.getF32Type());
-    // SmallVector<float> values = {(float) m_const, (float) k_const, (float) n_const, 1.0f, 1.0f, 1.0f};
-    // auto attr = DenseFPElementsAttr::get(tensorType, values);
-    // Value update = bodyBuilder.create<stablehlo::ConstantOp>(loc, tensorType, attr);
-    // Value update = C_sliced;
-    // Value update = betaBroadcast;
     // Result is row-major [n,m] which has same memory layout as column-major [m,n]
     // Just flatten and write back
     Value outFlat = stablehlo::ReshapeOp::create(bodyBuilder, loc,
@@ -636,11 +568,14 @@ struct BlasRaisingPass
     outFlat = stablehlo::DynamicUpdateSliceOp::create(bodyBuilder, loc,
       C_flat.getType(), ValueRange{C_flat, outFlat, zero_i64});
     
-    outputs.at(11) = outFlat;
-
+    allArgs[11] = outFlat;
     SmallVector<Value> result;
-    for (auto &entry : outputs) {
-        result.push_back(entry.second);
+    int idx = 0;
+    for (auto &value_wrapper : operands) {
+      if (!value_wrapper.isConst) {
+        result.push_back(allArgs[idx]);
+      }
+      ++idx;
     }
     func::ReturnOp::create(bodyBuilder, loc, ValueRange{result});
     return fn;
@@ -650,6 +585,7 @@ struct BlasRaisingPass
     auto op = getOperation();
     llvm::errs() << "=== BlasRaisingPass running ===\n";
     llvm::errs().flush();
+
     initializeInputMap(op->getContext());
 
     // op->walk([&](LLVM::LLVMFuncOp callOp) {
@@ -664,8 +600,9 @@ struct BlasRaisingPass
     op->walk([&](LLVM::CallOp callOp) {
       auto calleeName = callOp.getCallee().value_or("");
       if (calleeName == "cublasSgemm_v2") {
-        llvm::errs() << "Found cublasSgemm_v2 call\n";
-        replaceCublasSGemm_v2(callOp);
+        replaceCall(callOp, [this](LLVM::CallOp call, SmallVector<ValueWrapper> ops, func::FuncOp fn) {
+          return this->getCublasSGemm_v2(call, ops, fn);
+        }, StringRef("cublasSgemm_v2"));
 
         cublasCalls.push_back(callOp);
       }
