@@ -62,6 +62,14 @@ struct BlasRaisingPass
     : public enzyme::impl::BlasRaisingPassBase<BlasRaisingPass> {
   using BlasRaisingPassBase::BlasRaisingPassBase;
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<mlir::func::FuncDialect>();
+    registry.insert<mlir::LLVM::LLVMDialect>();
+    registry.insert<mlir::stablehlo::StablehloDialect>();
+    registry.insert<mlir::memref::MemRefDialect>();
+    registry.insert<mlir::gpu::GPUDialect>();
+  }
+
   struct ValueWrapper {
     Value val;
     bool isConst;
