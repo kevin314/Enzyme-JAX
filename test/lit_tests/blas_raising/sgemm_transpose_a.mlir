@@ -36,7 +36,7 @@ module attributes {dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vec
     %8 = "enzymexla.memref2pointer"(%memref_2) : (memref<24xf32, 1>) -> !llvm.ptr
     %9 = "enzymexla.pointer2memref"(%0) : (!llvm.ptr) -> memref<?x!llvm.ptr>
     %10 = affine.load %9[0] {alignment = 8 : i64, ordering = 0 : i64, tbaa = [#tbaa_tag1]} : memref<?x!llvm.ptr>
-    %11 = llvm.call @cublasSgemm_v2(%10, %c0_i32, %c0_i32, %c2_i32, %c3_i32, %c4_i32, %1, %6, %c2_i32, %7, %c4_i32, %2, %8, %c2_i32) {no_unwind} : (!llvm.ptr {llvm.noundef}, i32 {llvm.noundef}, i32 {llvm.noundef}, i32 {llvm.noundef}, i32 {llvm.noundef}, i32 {llvm.noundef}, !llvm.ptr {llvm.nonnull, llvm.noundef}, !llvm.ptr {llvm.noundef}, i32 {llvm.noundef}, !llvm.ptr {llvm.noundef}, i32 {llvm.noundef}, !llvm.ptr {llvm.nonnull, llvm.noundef}, !llvm.ptr {llvm.noundef}, i32 {llvm.noundef}) -> i32
+    %11 = llvm.call @cublasSgemm_v2(%10, %c1_i32, %c0_i32, %c2_i32, %c3_i32, %c4_i32, %1, %6, %c2_i32, %7, %c4_i32, %2, %8, %c2_i32) {no_unwind} : (!llvm.ptr {llvm.noundef}, i32 {llvm.noundef}, i32 {llvm.noundef}, i32 {llvm.noundef}, i32 {llvm.noundef}, i32 {llvm.noundef}, !llvm.ptr {llvm.nonnull, llvm.noundef}, !llvm.ptr {llvm.noundef}, i32 {llvm.noundef}, !llvm.ptr {llvm.noundef}, i32 {llvm.noundef}, !llvm.ptr {llvm.nonnull, llvm.noundef}, !llvm.ptr {llvm.noundef}, i32 {llvm.noundef}) -> i32
     %12 = "enzymexla.pointer2memref"(%0) : (!llvm.ptr) -> memref<?x!llvm.ptr>
     %13 = affine.load %12[0] {alignment = 8 : i64, ordering = 0 : i64, tbaa = [#tbaa_tag1]} : memref<?x!llvm.ptr>
     %14 = llvm.call @cublasDestroy_v2(%13) {no_unwind} : (!llvm.ptr {llvm.noundef}) -> i32
@@ -58,6 +58,8 @@ module attributes {dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vec
 // CHECK: func.func private
 // CHECK-SAME: tensor<f32>, tensor<?xf32>, tensor<?xf32>, tensor<f32>, tensor<?xf32>
 // CHECK: stablehlo.slice
-// CHECK: stablehlo.reshape
-// CHECK-NOT: stablehlo.transpose
+// CHECK: stablehlo.reshape {{.*}} tensor<2x4xf32>
+// CHECK: stablehlo.transpose {{.*}} dims = [1, 0]
+// CHECK: stablehlo.slice
+// CHECK: stablehlo.reshape {{.*}} tensor<3x4xf32>
 // CHECK: stablehlo.dot_general
