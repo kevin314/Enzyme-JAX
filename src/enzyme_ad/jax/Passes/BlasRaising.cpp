@@ -99,9 +99,9 @@ struct BlasRaisingPass
     typeMap["cublasSgemm_v2"].push_back(i32); // ldc
   }
   
-  StringRef getRaisedFuncName(StringRef funcName) {
+  std::string getRaisedFuncName(StringRef funcName) {
     static uint64_t counter = 0;
-    return StringRef(funcName.str() + std::to_string(counter++));
+    return funcName.str() + std::to_string(counter++);
   }
 
   SmallVector<ValueWrapper> transformOperands(LLVM::CallOp call, StringRef name) {
@@ -281,7 +281,7 @@ struct BlasRaisingPass
     auto loc = call.getLoc();
     auto module = call->getParentOfType<ModuleOp>();
 
-    StringRef fnName = getRaisedFuncName(name);
+    std::string fnName = getRaisedFuncName(name);
 
     // transform operands
     SmallVector<ValueWrapper> operands = transformOperands(call, StringRef(name));

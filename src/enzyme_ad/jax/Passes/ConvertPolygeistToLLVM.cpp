@@ -2816,8 +2816,9 @@ private:
         SymbolTable::lookupNearestSymbolFrom(wrap, wrap.getFn()));
     stream << fn << "\n" << '\0';
 
+    static int xlamodCounter = 0;
     auto stringval = mlir::LLVM::createGlobalString(
-        loc, rewriter, "xlamod", str, LLVM::Linkage::Internal);
+        loc, rewriter, std::string("xlamod.") + std::to_string(xlamodCounter++), str, LLVM::Linkage::Internal);
 
     auto ptrty = LLVM::LLVMPointerType::get(rewriter.getContext());
 
