@@ -40,6 +40,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include <string>
 
 namespace mlir {
 namespace enzyme {
@@ -70,14 +71,12 @@ struct BlasRaisingPass
     registry.insert<mlir::gpu::GPUDialect>();
   }
 
-  struct ValueWrapper {
-    Value val;
-    bool isConst;
-  };
-
-  using CublasConstructor = std::function<func::FuncOp(LLVM::CallOp, SmallVector<ValueWrapper>, func::FuncOp)>;
+  using CublasConstructor = std::function<func::FuncOp(LLVM::CallOp, SmallVector<Value>, func::FuncOp)>;
+  using CublasOperandTypeFn = std::function<SmallVector<Type>(MLIRContext *)>;
+  using CublasOperandShapeFn = std::function<std::map<int, SmallVector<int>>()>;
 
   llvm::StringMap<SmallVector<Type>> typeMap;
+  llvm::StringMap<std::map<int, SmallVector<int>>> shapeIndexMap;
   void initializeInputMap(MLIRContext *ctx) {
     Type i32 = IntegerType::get(ctx, 32);
     Type f32 = Float32Type::get(ctx);
@@ -91,11 +90,14 @@ struct BlasRaisingPass
     typeMap["cublasSgemm_v2"].push_back(i32); // k
     typeMap["cublasSgemm_v2"].push_back(f32); // alpha
     typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // A
+    shapeIndexMap["cublasSgemm_v2"][6] = SmallVector<int>({2, 4});
     typeMap["cublasSgemm_v2"].push_back(i32); // lda
     typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // B
+    shapeIndexMap["cublasSgemm_v2"][8] = SmallVector<int>({4, 3});
     typeMap["cublasSgemm_v2"].push_back(i32); // ldb
     typeMap["cublasSgemm_v2"].push_back(f32); // beta
     typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // C
+    shapeIndexMap["cublasSgemm_v2"][11] = SmallVector<int>({2, 3});
     typeMap["cublasSgemm_v2"].push_back(i32); // ldc
   }
   
@@ -104,13 +106,12 @@ struct BlasRaisingPass
     return funcName.str() + std::to_string(counter++);
   }
 
-  SmallVector<ValueWrapper> transformOperands(LLVM::CallOp call, StringRef name) {
+  SmallVector<Value> transformOperands(LLVM::CallOp call, SmallVector<Type> targetTypes) {
     auto modOp = call->getParentOfType<ModuleOp>();
     OpBuilder builder(call);
     Location loc = call.getLoc();
 
-    SmallVector<Type> targetTypes(typeMap[name.str()]);
-    SmallVector<ValueWrapper> newOperands;
+    SmallVector<Value> newOperands;
     int idx = 0;
     for (auto it = std::next(call.getOperands().begin());
         it != call.getOperands().end(); ++it, ++idx) {
@@ -118,11 +119,6 @@ struct BlasRaisingPass
       Type desiredType = targetTypes[idx];
 
       Attribute attr;
-      if (matchPattern(arg, m_Constant(&attr))) {
-        newOperands.push_back(ValueWrapper{arg, true});
-        continue;
-      }
-
       // Largely copied from AffineToStableHLORaising.cpp
       // Is tensor, just convert to memref
       if (auto tensorType = dyn_cast<TensorType>(desiredType)) {
@@ -131,7 +127,7 @@ struct BlasRaisingPass
               {ShapedType::kDynamic},
               tensorType.getElementType()
             );
-        newOperands.push_back(ValueWrapper{enzymexla::Pointer2MemrefOp::create(builder, loc, MT, arg), false});
+        newOperands.push_back(enzymexla::Pointer2MemrefOp::create(builder, loc, MT, arg));
         continue;
       }
 
@@ -165,7 +161,7 @@ struct BlasRaisingPass
       gpu::DeallocOp::create(builder, loc, (mlir::Type) nullptr,
                               ValueRange(), res);
       builder.setInsertionPoint(call);
-      newOperands.push_back(ValueWrapper{res, false});
+      newOperands.push_back(res);
     }
     return newOperands;
   }
@@ -276,111 +272,135 @@ struct BlasRaisingPass
     return stablehlo::DynamicUpdateSliceOp::create(builder, loc, orig.getType(), ValueRange{orig, flattened, zero_tensor});
   }
 
-  void replaceCall(LLVM::CallOp call, CublasConstructor constructor, StringRef name) {
+  func::FuncOp buildFunctionSignature(LLVM::CallOp call, SmallVector<Value> operands, std::map<int, SmallVector<int>> operandShapes, StringRef name) {
     MLIRContext *ctx = call.getContext();
+    OpBuilder Builder(ctx);
     auto loc = call.getLoc();
     auto module = call->getParentOfType<ModuleOp>();
 
     std::string fnName = getRaisedFuncName(name);
 
     // transform operands
-    SmallVector<ValueWrapper> operands = transformOperands(call, StringRef(name));
 
     // Construct new function type
     SmallVector<Type> newInputs;
     for (auto &value_wrapper : operands) {
-      if (!value_wrapper.isConst) {
-        auto argTy = cast<MemRefType>(value_wrapper.val.getType());
-        newInputs.push_back(RankedTensorType::get(argTy.getShape(), argTy.getElementType()));
-      }
+      auto argTy = cast<MemRefType>(value_wrapper.getType());
+      newInputs.push_back(RankedTensorType::get(argTy.getShape(), argTy.getElementType()));
     }
     SmallVector<Type> results(newInputs);
     auto newFuncType = mlir::FunctionType::get(ctx, newInputs, results);
 
     // Construct new function
-    auto fn = func::FuncOp::create(loc, fnName, newFuncType);
+    func::FuncOp fn = func::FuncOp::create(loc, fnName, newFuncType);
     fn.setPrivate();
     module.push_back(fn);
-
-    // fill in function with corresponding constructor
-    func::FuncOp f = constructor(call, operands, fn);
-
-    // create call to new function
-    SmallVector<Value> args;
-    for (auto value_wrapper : operands) {
-      if (!value_wrapper.isConst) {
-        args.push_back(value_wrapper.val);
+    
+    llvm::SmallVector<NamedAttribute> operandAttributes;
+    for (const auto &pair : operandShapes) {
+      int idx = pair.first;
+      const llvm::SmallVector<int> &shapeDims = pair.second;
+      for (int shapeDimIdx = 0; shapeDimIdx < shapeDims.size(); shapeDimIdx++) {
+        fn.setArgAttr(idx, "shape." + std::to_string(shapeDimIdx), Builder.getI32IntegerAttr(shapeDims[shapeDimIdx]));
       }
     }
+
+    return fn;
+  }
+
+  // Shape info is presented as (leading dimension, dim0, dim1, ...)
+  std::map<int, SmallVector<int>> getShapeInfoCublasSGemm_v2(MLIRContext *ctx) {
+    std::map<int, SmallVector<int>> shapeMap;
+    shapeMap[6] = SmallVector<int>({7, 2, 4});
+    shapeMap[8] = SmallVector<int>({9, 4, 3});
+    shapeMap[11] = SmallVector<int>({12, 2, 3});
+    return shapeMap;
+  }
+
+  SmallVector<Type> getOperandTypesCublasSGemm_v2(MLIRContext *ctx) {
+    Type i32 = IntegerType::get(ctx, 32);
+    Type f32 = Float32Type::get(ctx);
+    Type f32DynTensor2D = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, f32);
+
+    SmallVector<Type> types;
+    // cublasSgemm_v2
+    types.push_back(i32); // transA
+    types.push_back(i32); // transB
+    types.push_back(i32); // m
+    types.push_back(i32); // n
+    types.push_back(i32); // k
+    types.push_back(f32); // alpha
+    types.push_back(f32DynTensor2D); // A
+    types.push_back(i32); // lda
+    types.push_back(f32DynTensor2D); // B
+    types.push_back(i32); // ldb
+    types.push_back(f32); // beta
+    types.push_back(f32DynTensor2D); // C
+    types.push_back(i32); // ldc
+    return types;
+  }
+
+  void replaceCublasSGemm_v2(LLVM::CallOp call) {
+    std::string name = "CublasSGemm_v2";
+    MLIRContext *ctx = call.getContext();
+
+    SmallVector<Value> operands = transformOperands(call, getOperandTypesCublasSGemm_v2(ctx));
+    func::FuncOp fn = buildFunctionSignature(call, operands, getShapeInfoCublasSGemm_v2(ctx), name);
+    
+    // fill in function with corresponding constructor
+    func::FuncOp f = constructCublasSGemm_v2(fn);
+
+    // create call to new function
     OpBuilder builder(call);
     enzymexla::XLAWrapperOp::create(
       builder, call->getLoc(), SymbolRefAttr::get(f),
-      llvm::to_vector(args), nullptr, nullptr);
-    
+      llvm::to_vector(operands), nullptr, nullptr);
   }
 
-  SmallVector<Value> makeArgs(OpBuilder builder, Location loc, mlir::Block *entry, SmallVector<ValueWrapper> operands) {
-    // Merge passed args and constants into one array
-    auto args = entry->getArguments();
-    SmallVector<Value> allArgs;
-    int argIdx = 0;
-    for (auto &value_wrapper : operands) {
-      if (value_wrapper.isConst) {
-        auto unrankedTensorType = RankedTensorType::get({}, value_wrapper.val.getType());
-        Attribute attr;
-        matchPattern(value_wrapper.val, m_Constant(&attr));
-
-        allArgs.push_back(stablehlo::ConstantOp::create(
-          builder, value_wrapper.val.getLoc(), unrankedTensorType,
-          SplatElementsAttr::get(
-              unrankedTensorType,
-              ArrayRef<Attribute>(attr))
-          ));
-      } else {
-        allArgs.push_back(args[argIdx]);
-        ++argIdx;
-      }
-    }
-    return allArgs;
-  }
-
-  func::FuncOp getCublasSGemm_v2(LLVM::CallOp call, SmallVector<ValueWrapper> operands, func::FuncOp fn) {
-    auto module = call->getParentOfType<ModuleOp>();
-    auto loc = call.getLoc();
-    auto ctx = call.getContext();
-
+  func::FuncOp constructCublasSGemm_v2(func::FuncOp fn) {
     Block *entry = fn.addEntryBlock();
     OpBuilder bodyBuilder(entry, entry->begin());
-  
+    SmallVector<Value> operands(fn.getArguments().begin(), fn.getArguments().end());
+
+    // auto module = call->getParentOfType<ModuleOp>();
+    auto loc = fn.getLoc();
+    auto ctx = fn.getContext();
+
     // Extract arguments
-    SmallVector<Value> allArgs(makeArgs(bodyBuilder, loc, entry, operands));
     int i = 0;
-    Value transAenum = allArgs[i++];
-    Value transBenum = allArgs[i++];
-    Value m = allArgs[i++];
-    Value n = allArgs[i++];
-    Value k = allArgs[i++];
-    Value alpha = allArgs[i++];
-    Value A_flat = allArgs[i++];
-    Value lda = allArgs[i++];
-    Value B_flat = allArgs[i++];
-    Value ldb = allArgs[i++];
-    Value beta = allArgs[i++];
-    Value C_flat = allArgs[i++];
-    Value ldc = allArgs[i++];
+    Value transAenum = operands[i++];
+    Value transBenum = operands[i++];
+    Value m = operands[i++];
+    Value n = operands[i++];
+    Value k = operands[i++];
+    Value alpha = operands[i++];
+    Value A_flat = operands[i++];
+    Value lda = operands[i++];
+    Value B_flat = operands[i++];
+    Value ldb = operands[i++];
+    Value beta = operands[i++];
+    Value C_flat = operands[i++];
+    Value ldc = operands[i++];
 
     Type elemTy = getElemType(A_flat);
 
-    int64_t m_const = getConstantValue(m);
-    int64_t n_const = getConstantValue(n);
-    int64_t k_const = getConstantValue(k);
-    int64_t lda_const = getConstantValue(lda);
-    int64_t ldb_const = getConstantValue(ldb);
-    int64_t ldc_const = getConstantValue(ldc);
+    // int64_t m_const = getConstantValue(m);
+    int64_t m_const = 2;
+    // int64_t n_const = getConstantValue(n);
+    int64_t n_const = 3;
+    // int64_t k_const = getConstantValue(k);
+    int64_t k_const = 4;
+    // int64_t lda_const = getConstantValue(lda);
+    int64_t lda_const = 2;
+    // int64_t ldb_const = getConstantValue(ldb);
+    int64_t ldb_const = 4;
+    // int64_t ldc_const = getConstantValue(ldc);
+    int64_t ldc_const = 2;
 
-    int64_t transAenum_const = getConstantValue(transAenum);
-    int64_t transBenum_const = getConstantValue(transBenum);
-
+    // int64_t transAenum_const = getConstantValue(transAenum);
+    int64_t transAenum_const = 0;
+    // int64_t transBenum_const = getConstantValue(transBenum);
+    int64_t transBenum_const = 0;
 
     // If transA or transB matches any of these enums, take the transpose
     SmallVector<int64_t> transposeEnums = {1, 2};
@@ -590,13 +610,11 @@ struct BlasRaisingPass
     outFlat = stablehlo::DynamicUpdateSliceOp::create(bodyBuilder, loc,
       C_flat.getType(), ValueRange{C_flat, outFlat, zero_i64});
     
-    allArgs[11] = outFlat;
+    operands[11] = outFlat;
     SmallVector<Value> result;
     int idx = 0;
-    for (auto &value_wrapper : operands) {
-      if (!value_wrapper.isConst) {
-        result.push_back(allArgs[idx]);
-      }
+    for (auto &value : operands) {
+        result.push_back(operands[idx]);
       ++idx;
     }
     func::ReturnOp::create(bodyBuilder, loc, ValueRange{result});
@@ -622,10 +640,7 @@ struct BlasRaisingPass
     op->walk([&](LLVM::CallOp callOp) {
       auto calleeName = callOp.getCallee().value_or("");
       if (calleeName == "cublasSgemm_v2") {
-        replaceCall(callOp, [this](LLVM::CallOp call, SmallVector<ValueWrapper> ops, func::FuncOp fn) {
-          return this->getCublasSGemm_v2(call, ops, fn);
-        }, StringRef("cublasSgemm_v2"));
-
+        replaceCublasSGemm_v2(callOp);
         cublasCalls.push_back(callOp);
       }
     });
