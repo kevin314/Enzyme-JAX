@@ -27,6 +27,17 @@ def BlasRaisingPass : Pass<"blas-raise"> {
   ];
 }
 
+def PropagateShapesPass : Pass<"propagate-shapes"> {
+  let summary = "Propagates shapes known at runtime";
+  let dependentDialects = [
+    "stablehlo::StablehloDialect",
+    "tensor::TensorDialect",
+    "enzyme::EnzymeDialect",
+    "enzymexla::EnzymeXLADialect",
+    "chlo::ChloDialect"
+  ];
+}
+
 def CanonicalizeLoopsPass : InterfacePass<"canonicalize-loops", 
                                           "mlir::FunctionOpInterface"> {
   let summary = "Canonicalize loops";

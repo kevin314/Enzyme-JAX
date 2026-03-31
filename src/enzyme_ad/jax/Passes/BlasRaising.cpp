@@ -40,6 +40,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include <cstdint>
 #include <string>
 
 namespace mlir {
@@ -57,8 +58,6 @@ using namespace mlir::enzyme;
 #define CUBLAS_OP_C (2)
 
 namespace {
-
-  // TODO: better input mapping, reshape 1D inputs to be 2D
 struct BlasRaisingPass
     : public enzyme::impl::BlasRaisingPassBase<BlasRaisingPass> {
   using BlasRaisingPassBase::BlasRaisingPassBase;
@@ -75,32 +74,6 @@ struct BlasRaisingPass
   using CublasOperandTypeFn = std::function<SmallVector<Type>(MLIRContext *)>;
   using CublasOperandShapeFn = std::function<std::map<int, SmallVector<int>>()>;
 
-  llvm::StringMap<SmallVector<Type>> typeMap;
-  llvm::StringMap<std::map<int, SmallVector<int>>> shapeIndexMap;
-  void initializeInputMap(MLIRContext *ctx) {
-    Type i32 = IntegerType::get(ctx, 32);
-    Type f32 = Float32Type::get(ctx);
-    Type f32DynTensor2D = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, f32);
-
-    // cublasSgemm_v2
-    typeMap["cublasSgemm_v2"].push_back(i32); // transA
-    typeMap["cublasSgemm_v2"].push_back(i32); // transB
-    typeMap["cublasSgemm_v2"].push_back(i32); // m
-    typeMap["cublasSgemm_v2"].push_back(i32); // n
-    typeMap["cublasSgemm_v2"].push_back(i32); // k
-    typeMap["cublasSgemm_v2"].push_back(f32); // alpha
-    typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // A
-    shapeIndexMap["cublasSgemm_v2"][6] = SmallVector<int>({2, 4});
-    typeMap["cublasSgemm_v2"].push_back(i32); // lda
-    typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // B
-    shapeIndexMap["cublasSgemm_v2"][8] = SmallVector<int>({4, 3});
-    typeMap["cublasSgemm_v2"].push_back(i32); // ldb
-    typeMap["cublasSgemm_v2"].push_back(f32); // beta
-    typeMap["cublasSgemm_v2"].push_back(f32DynTensor2D); // C
-    shapeIndexMap["cublasSgemm_v2"][11] = SmallVector<int>({2, 3});
-    typeMap["cublasSgemm_v2"].push_back(i32); // ldc
-  }
-  
   std::string getRaisedFuncName(StringRef funcName) {
     static uint64_t counter = 0;
     return funcName.str() + std::to_string(counter++);
@@ -222,54 +195,84 @@ struct BlasRaisingPass
     );
   }
 
-  Value make2DTensor(OpBuilder &builder, Location &loc, Value tensor, int64_t ldim, int64_t num_rows, int64_t num_cols) {
+  // The input tensor is stored as column-major format and has dimensions lda x other_dim (flattened). We want to return it cropped
+  // and reshaped to row-major ldim_size by other_dim.
+  Value make2DTensor(OpBuilder &builder, Location &loc, Value tensor, int64_t ldim, int64_t ldim_size, int64_t other_dim) {
     Type elemTy = getElemType(tensor);
     auto ctx = builder.getContext();
 
-    auto sliced = stablehlo::SliceOp::create(builder, loc, RankedTensorType::get({ldim * num_cols}, elemTy), tensor,
-      DenseI64ArrayAttr::get(ctx, {(int64_t) 0}),
-      DenseI64ArrayAttr::get(ctx, {ldim * num_cols}),
-      DenseI64ArrayAttr::get(ctx, {(int64_t) 1})
+    auto reshaped = stablehlo::ReshapeOp::create(builder,
+      loc, 
+      RankedTensorType::get({other_dim, ldim}, elemTy),
+      tensor
     );
 
-    auto reshaped = stablehlo::ReshapeOp::create(
-      builder,
-        loc,
-        RankedTensorType::get(
-          {ldim, num_cols},
-          elemTy
-        ),
-        sliced
-      );
-    
-    return stablehlo::SliceOp::create(builder, loc, RankedTensorType::get({num_rows, num_cols}, elemTy), reshaped,
+    // Convert to row major
+    auto transposed = stablehlo::TransposeOp::create(builder,
+      loc,
+      RankedTensorType::get({ldim, other_dim}, elemTy),
+      reshaped,
+      SmallVector<int64_t>{1, 0}
+    );
+
+    return stablehlo::SliceOp::create(builder,
+      loc,
+      RankedTensorType::get({ldim_size, other_dim}, elemTy),
+      transposed,
       DenseI64ArrayAttr::get(ctx, {(int64_t) 0, (int64_t) 0}),
-      DenseI64ArrayAttr::get(ctx, {num_rows, num_cols}),
+      DenseI64ArrayAttr::get(ctx, {ldim_size, other_dim}),
       DenseI64ArrayAttr::get(ctx, {(int64_t) 1, (int64_t) 1})
     );
   }
 
-  Value make1DTensor(OpBuilder &builder, Location loc,
+  Value writebackTo1DTensor(OpBuilder &builder, Location loc,
                           Value orig,
                           Value update,
                           int64_t ldim,
-                          int64_t num_rows,
-                          int64_t num_cols) {
+                          int64_t ldim_size,
+                          int64_t other_dim) {
     auto ctx = builder.getContext();
     Type elemTy = getElemType(orig);
 
     auto startIndices = DenseI64ArrayAttr::get(ctx, {0, 0});
 
-    Value zero_tensor = stablehlo::ConstantOp::create(
-        builder,
-        loc,
-        DenseIntElementsAttr::get(RankedTensorType::get({}, builder.getI64Type()), {(int64_t) 0})
-      );
+    auto reshaped_orig = stablehlo::ReshapeOp::create(builder,
+      loc, 
+      RankedTensorType::get({other_dim, ldim}, elemTy),
+      orig
+    );
 
-    Value flattened =
-        stablehlo::ReshapeOp::create(builder, loc, RankedTensorType::get({num_rows*num_cols}, elemTy), update);
+    auto transposed_update = stablehlo::TransposeOp::create(builder,
+      loc,
+      RankedTensorType::get({other_dim, ldim_size}, elemTy),
+      update,
+      SmallVector<int64_t>{1, 0}
+    );
 
-    return stablehlo::DynamicUpdateSliceOp::create(builder, loc, orig.getType(), ValueRange{orig, flattened, zero_tensor});
+    Value zero_tensor = stablehlo::ConstantOp::create(builder, loc,
+      DenseIntElementsAttr::get(RankedTensorType::get({}, builder.getI64Type()), {(int64_t)0}));
+    auto updated_2D_orig = stablehlo::DynamicUpdateSliceOp::create(builder,
+      loc,
+      reshaped_orig.getType(),
+      ValueRange{reshaped_orig, transposed_update, zero_tensor, zero_tensor}
+    );
+
+    auto tmp = stablehlo::ReshapeOp::create(
+      builder,
+      loc,
+      RankedTensorType::get({other_dim * ldim}, elemTy),
+      updated_2D_orig
+    );
+
+    Value size_tensor = stablehlo::ConstantOp::create(builder, loc,
+      DenseIntElementsAttr::get(RankedTensorType::get({1}, builder.getI64Type()), {other_dim*ldim}));
+    return stablehlo::DynamicReshapeOp::create(
+      builder,
+      loc,
+      RankedTensorType::get({ShapedType::kDynamic}, elemTy),
+      tmp,
+      size_tensor
+    );
   }
 
   func::FuncOp buildFunctionSignature(LLVM::CallOp call, SmallVector<Value> operands, std::map<int, SmallVector<int>> operandShapes, StringRef name) {
@@ -296,12 +299,14 @@ struct BlasRaisingPass
     fn.setPrivate();
     module.push_back(fn);
     
-    llvm::SmallVector<NamedAttribute> operandAttributes;
     for (const auto &pair : operandShapes) {
       int idx = pair.first;
       const llvm::SmallVector<int> &shapeDims = pair.second;
-      for (int shapeDimIdx = 0; shapeDimIdx < shapeDims.size(); shapeDimIdx++) {
-        fn.setArgAttr(idx, "shape." + std::to_string(shapeDimIdx), Builder.getI32IntegerAttr(shapeDims[shapeDimIdx]));
+      if (shapeDims.size() > 0 && shapeDims[0] >= 0) {
+        fn.setArgAttr(idx, "shape.ld", Builder.getI32IntegerAttr(shapeDims[0]));
+      }
+      for (int shapeDimIdx = 1; shapeDimIdx < shapeDims.size(); shapeDimIdx++) {
+        fn.setArgAttr(idx, "shape." + std::to_string(shapeDimIdx-1), Builder.getI32IntegerAttr(shapeDims[shapeDimIdx]));
       }
     }
 
@@ -417,50 +422,26 @@ struct BlasRaisingPass
     if (transA) {
       // matrix is [k,m] column-major, becomes [m,k] row-major
       // Then transpose to [k,m] for the row-major computation
-      auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
-        RankedTensorType::get({k_const * m_const}, elemTy), A_flat,
-        DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
-        DenseI64ArrayAttr::get(ctx, {k_const * m_const}),
-        DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
-      auto A_reshaped = stablehlo::ReshapeOp::create(bodyBuilder, loc,
-        RankedTensorType::get({m_const, k_const}, elemTy), sliced);
+      auto A_reshaped = make2DTensor(bodyBuilder, loc, A_flat, lda_const, k_const, m_const);
       A_eff = stablehlo::TransposeOp::create(bodyBuilder, loc,
-        RankedTensorType::get({k_const, m_const}, elemTy),
-        A_reshaped, SmallVector<int64_t>{1, 0});
+        RankedTensorType::get({m_const, k_const}, elemTy),
+        A_reshaped, SmallVector<int64_t>{1, 0}
+      );
     } else {
       // matrix is [m,k] column-major, becomes [k,m] row-major
-      auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
-        RankedTensorType::get({m_const * k_const}, elemTy), A_flat,
-        DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
-        DenseI64ArrayAttr::get(ctx, {m_const * k_const}),
-        DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
-      A_eff = stablehlo::ReshapeOp::create(bodyBuilder, loc,
-        RankedTensorType::get({k_const, m_const}, elemTy), sliced);
+      A_eff = make2DTensor(bodyBuilder, loc, A_flat, lda_const, m_const, k_const);
     }
 
     Value B_eff;
     if (transB) {
-      // matrix is [n,k] column-major, becomes [k,n] row-major
-      // Then transpose to [n,k] for the row-major computation
-      auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
-        RankedTensorType::get({n_const * k_const}, elemTy), B_flat,
-        DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
-        DenseI64ArrayAttr::get(ctx, {n_const * k_const}),
-        DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
-      auto B_reshaped = stablehlo::ReshapeOp::create(bodyBuilder, loc,
-        RankedTensorType::get({k_const, n_const}, elemTy), sliced);
+      auto B_reshaped = make2DTensor(bodyBuilder, loc, B_flat, ldb_const, n_const, k_const);
       B_eff = stablehlo::TransposeOp::create(bodyBuilder, loc,
-        RankedTensorType::get({n_const, k_const}, elemTy),
-        B_reshaped, SmallVector<int64_t>{1, 0});
+        RankedTensorType::get({k_const, n_const}, elemTy),
+        B_reshaped,
+        SmallVector<int64_t>{1, 0}
+      );
     } else {
-      // matrix is [k,n] column-major, becomes [n,k] row-major
-      auto sliced = stablehlo::SliceOp::create(bodyBuilder, loc,
-        RankedTensorType::get({k_const * n_const}, elemTy), B_flat,
-        DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
-        DenseI64ArrayAttr::get(ctx, {k_const * n_const}),
-        DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
-      B_eff = stablehlo::ReshapeOp::create(bodyBuilder, loc,
-        RankedTensorType::get({n_const, k_const}, elemTy), sliced);
+      B_eff = make2DTensor(bodyBuilder, loc, B_flat, ldb_const, k_const, n_const);
     }
     // Value A_sliced = makeDynamicSlice(bodyBuilder, loc, A, m_const, k_const);
     // Value B_sliced = makeDynamicSlice(bodyBuilder, loc, B, k_const, n_const);
@@ -542,25 +523,20 @@ struct BlasRaisingPass
         bodyBuilder.getContext(),
         /*lhsBatchingDims=*/{},
         /*rhsBatchingDims=*/{},
-        /*lhsContractingDims=*/{1},  // B_eff[n,k] contracts on dim 1 (k)
-        /*rhsContractingDims=*/{0}   // A_eff[k,m] contracts on dim 0 (k)
+        /*lhsContractingDims=*/{1},
+        /*rhsContractingDims=*/{0}
       );
 
     Value dot =
         stablehlo::DotGeneralOp::create(
             bodyBuilder,
-            loc, RankedTensorType::get({n_const, m_const}, elemTy), B_eff, A_eff,
+            loc, RankedTensorType::get({m_const, n_const}, elemTy), A_eff, B_eff,
             dotDimNumbers, nullptr, nullptr);
 
-    // Value dot = builder.create<stablehlo::DotGeneralOp>(
-    //     loc, resultType, A, B, dotDimNumbers,
-    //     nullptr,  // precision_config
-    //     nullptr); // algorithm
-
     // STEP 3: alpha * dot + beta * C
-    // All operations are in row-major [n, m] space
+    // All operations are in row-major space
     // Scale dot
-    Value broadcastSize = makePairFromScalars(bodyBuilder, loc, n, m);
+    Value broadcastSize = makePairFromScalars(bodyBuilder, loc, m, n);
     SmallVector<int64_t> b_dims = {0, 1};
     auto b_dimsAttr = mlir::DenseI64ArrayAttr::get(ctx, b_dims);
     auto alphaTensor = stablehlo::ReshapeOp::create(
@@ -575,15 +551,7 @@ struct BlasRaisingPass
       dot,
       alphaBroadcast);
 
-    // C: column-major [m,n] = row-major [n,m] when reshaped
-    auto C_sliced_1d = stablehlo::SliceOp::create(bodyBuilder, loc,
-      RankedTensorType::get({m_const * n_const}, elemTy), C_flat,
-      DenseI64ArrayAttr::get(ctx, {(int64_t)0}),
-      DenseI64ArrayAttr::get(ctx, {m_const * n_const}),
-      DenseI64ArrayAttr::get(ctx, {(int64_t)1}));
-    Value C_sliced = stablehlo::ReshapeOp::create(bodyBuilder, loc,
-      RankedTensorType::get({n_const, m_const}, elemTy), C_sliced_1d);
-
+    auto C_sliced = make2DTensor(bodyBuilder, loc, C_flat, ldc_const, m_const, n_const);
     // Scale C
     auto betaTensor = stablehlo::ReshapeOp::create(
       bodyBuilder, loc, RankedTensorType::get({1, 1}, getElemType(beta)), beta
@@ -601,14 +569,16 @@ struct BlasRaisingPass
     Value update =
         bodyBuilder.create<stablehlo::AddOp>(loc, scaledDot.getType(), scaledDot,
                                             scaledC);
-    // Result is row-major [n,m] which has same memory layout as column-major [m,n]
-    // Just flatten and write back
-    Value outFlat = stablehlo::ReshapeOp::create(bodyBuilder, loc,
-      RankedTensorType::get({n_const * m_const}, elemTy), update);
-    Value zero_i64 = stablehlo::ConstantOp::create(bodyBuilder, loc,
-      DenseIntElementsAttr::get(RankedTensorType::get({}, bodyBuilder.getI64Type()), {(int64_t)0}));
-    outFlat = stablehlo::DynamicUpdateSliceOp::create(bodyBuilder, loc,
-      C_flat.getType(), ValueRange{C_flat, outFlat, zero_i64});
+
+
+    // Write back
+    // Value outFlat = stablehlo::ReshapeOp::create(bodyBuilder, loc,
+    //   RankedTensorType::get({n_const * m_const}, elemTy), update);
+    // Value zero_i64 = stablehlo::ConstantOp::create(bodyBuilder, loc,
+    //   DenseIntElementsAttr::get(RankedTensorType::get({}, bodyBuilder.getI64Type()), {(int64_t)0}));
+    // outFlat = stablehlo::DynamicUpdateSliceOp::create(bodyBuilder, loc,
+    //   C_flat.getType(), ValueRange{C_flat, outFlat, zero_i64});
+    Value outFlat = writebackTo1DTensor(bodyBuilder, loc, C_flat, update, ldc_const, m_const, n_const);
     
     operands[11] = outFlat;
     SmallVector<Value> result;
@@ -625,8 +595,6 @@ struct BlasRaisingPass
     auto op = getOperation();
     llvm::errs() << "=== BlasRaisingPass running ===\n";
     llvm::errs().flush();
-
-    initializeInputMap(op->getContext());
 
     // op->walk([&](LLVM::LLVMFuncOp callOp) {
     //   auto calleeName = callOp.getName();
